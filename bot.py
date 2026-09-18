@@ -202,6 +202,23 @@ VOICE_NAMES = {
 }
 
 
+CATEGORY_NAMES = {
+    "START HERE": "🚪 START HERE",
+    "GAME UPDATES": "📢 GAME UPDATES",
+    "COMMUNITY": "🏙️ COMMUNITY",
+    "SUPPORT": "🛟 SUPPORT",
+    "PLAYTEST": "🧪 PLAYTEST",
+    "TEAM": "🔒 TEAM",
+    "TICKETS": "🎫 TICKETS",
+}
+
+TICKET_EMOJIS = {
+    "help": "🎮",
+    "player": "🚩",
+    "exploit": "🔐",
+}
+
+
 def safe_name(value: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "-", value.lower().strip()).strip("-")
     return value[:50] or "member"
@@ -231,6 +248,23 @@ def find_text(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
 
 
 def find_category(guild: discord.Guild, name: str) -> Optional[discord.CategoryChannel]:
+    if name in CATEGORY_NAMES:
+        display_name = CATEGORY_NAMES[name]
+        return (
+            discord.utils.get(guild.categories, name=display_name)
+            or discord.utils.get(guild.categories, name=name)
+        )
+
+    plain_match = next(
+        (plain for plain, display in CATEGORY_NAMES.items() if display == name),
+        None,
+    )
+    if plain_match:
+        return (
+            discord.utils.get(guild.categories, name=name)
+            or discord.utils.get(guild.categories, name=plain_match)
+        )
+
     return discord.utils.get(guild.categories, name=name)
 
 
@@ -425,8 +459,9 @@ class TicketButton(discord.ui.Button):
                 )
 
         try:
+            ticket_emoji = TICKET_EMOJIS.get(self.ticket_type, "🎫")
             channel = await guild.create_text_channel(
-                f"{self.ticket_type}-{safe_name(user.display_name)}",
+                f"{ticket_emoji}・{self.ticket_type}-{safe_name(user.display_name)}",
                 category=category,
                 topic=f"ticket-owner:{user.id} | type:{self.ticket_type}",
                 overwrites=overwrites,
@@ -847,7 +882,7 @@ async def setup_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="emojis",
-    description="Add the Smash & Steal emojis to existing channel names",
+    description="Fix emojis across Smash & Steal categories and channels",
     guild=GUILD,
 )
 async def emojis_cmd(interaction: discord.Interaction):
@@ -864,10 +899,45 @@ async def emojis_cmd(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild = interaction.guild
-    renamed = []
+
+    renamed_categories = []
+    renamed_text = []
+    renamed_voice = []
+    renamed_tickets = []
     already_ok = []
     missing = []
     failed = []
+
+    async def rename_channel(channel, display_name, bucket, label):
+        if channel.name == display_name:
+            already_ok.append(display_name)
+            return
+        try:
+            await channel.edit(
+                name=display_name,
+                reason="Smash & Steal full emoji update",
+            )
+            bucket.append(display_name)
+            await asyncio.sleep(0.25)
+        except discord.Forbidden:
+            failed.append(f"{label} (Missing Access)")
+        except discord.HTTPException as exc:
+            failed.append(f"{label} (HTTP {exc.status})")
+
+    for plain_name, display_name in CATEGORY_NAMES.items():
+        category = (
+            discord.utils.get(guild.categories, name=display_name)
+            or discord.utils.get(guild.categories, name=plain_name)
+        )
+        if not category:
+            missing.append(f"Category: {plain_name}")
+            continue
+        await rename_channel(
+            category,
+            display_name,
+            renamed_categories,
+            f"Category: {plain_name}",
+        )
 
     for base_name, display_name in CHANNEL_NAMES.items():
         channel = (
@@ -875,22 +945,14 @@ async def emojis_cmd(interaction: discord.Interaction):
             or discord.utils.get(guild.text_channels, name=base_name)
         )
         if not channel:
-            missing.append(base_name)
+            missing.append(f"Text: {base_name}")
             continue
-        if channel.name == display_name:
-            already_ok.append(display_name)
-            continue
-        try:
-            await channel.edit(
-                name=display_name,
-                reason="Smash & Steal emoji channel update",
-            )
-            renamed.append(display_name)
-            await asyncio.sleep(0.2)
-        except discord.Forbidden:
-            failed.append(f"{base_name} (Missing Access)")
-        except discord.HTTPException as exc:
-            failed.append(f"{base_name} ({exc.status})")
+        await rename_channel(
+            channel,
+            display_name,
+            renamed_text,
+            f"Text: {base_name}",
+        )
 
     for base_name, display_name in VOICE_NAMES.items():
         channel = (
@@ -898,34 +960,62 @@ async def emojis_cmd(interaction: discord.Interaction):
             or discord.utils.get(guild.voice_channels, name=base_name)
         )
         if not channel:
-            missing.append(base_name)
+            missing.append(f"Voice: {base_name}")
             continue
-        if channel.name == display_name:
-            already_ok.append(display_name)
+        await rename_channel(
+            channel,
+            display_name,
+            renamed_voice,
+            f"Voice: {base_name}",
+        )
+
+    for channel in list(guild.text_channels):
+        topic = channel.topic or ""
+        if "ticket-owner:" not in topic:
             continue
-        try:
-            await channel.edit(
-                name=display_name,
-                reason="Smash & Steal emoji voice update",
-            )
-            renamed.append(display_name)
-            await asyncio.sleep(0.2)
-        except discord.Forbidden:
-            failed.append(f"{base_name} (Missing Access)")
-        except discord.HTTPException as exc:
-            failed.append(f"{base_name} ({exc.status})")
+
+        type_match = re.search(r"type:(help|player|exploit)", topic)
+        if not type_match:
+            continue
+
+        ticket_type = type_match.group(1)
+        emoji = TICKET_EMOJIS.get(ticket_type, "🎫")
+        current_base = re.sub(r"^[^a-zA-Z0-9]+・?", "", channel.name)
+        if current_base.startswith(f"{ticket_type}-"):
+            suffix = current_base[len(ticket_type) + 1:]
+        else:
+            suffix = safe_name(channel.name)
+
+        display_name = f"{emoji}・{ticket_type}-{suffix}"
+        await rename_channel(
+            channel,
+            display_name,
+            renamed_tickets,
+            f"Ticket: {channel.name}",
+        )
 
     lines = [
-        "## ✅ Channel emoji update finished",
-        f"Renamed: **{len(renamed)}**",
-        f"Already correct: **{len(already_ok)}**",
-        f"Missing channels: **{len(missing)}**",
-        f"Failed: **{len(failed)}**",
+        "## ✅ Full emoji update finished",
+        f"📁 Categories renamed: **{len(renamed_categories)}**",
+        f"💬 Text channels renamed: **{len(renamed_text)}**",
+        f"🔊 Voice channels renamed: **{len(renamed_voice)}**",
+        f"🎫 Ticket channels renamed: **{len(renamed_tickets)}**",
+        f"✅ Already correct: **{len(already_ok)}**",
+        f"❓ Missing: **{len(missing)}**",
+        f"❌ Failed: **{len(failed)}**",
     ]
+
     if failed:
-        lines.append("\n**Could not rename:**\n" + "\n".join(f"• {x}" for x in failed[:15]))
+        lines.append(
+            "\n**Could not rename:**\n"
+            + "\n".join(f"• {item}" for item in failed[:20])
+        )
+
     if missing:
-        lines.append("\n**Not found:**\n" + "\n".join(f"• {x}" for x in missing[:15]))
+        lines.append(
+            "\n**Not found:**\n"
+            + "\n".join(f"• {item}" for item in missing[:20])
+        )
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
