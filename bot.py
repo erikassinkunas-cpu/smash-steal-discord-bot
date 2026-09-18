@@ -17,26 +17,144 @@ GUILD_ID = int(GUILD_ID_RAW)
 intents = discord.Intents.default()
 intents.guilds = True
 
-ROLE_DEFS = {
-    "Founder": True,
-    "Developer": True,
-    "Community Manager": True,
-    "Moderator": True,
-    "Helper": True,
-    "Tester": False,
-    "Early Crew": False,
-    "Bug Hunter": False,
-    "Content Creator": False,
-    "Contributor": False,
-    "Member": False,
-    "Update Ping": False,
-    "Playtest Ping": False,
-    "Event Ping": False,
-    "Sneak Peek Ping": False,
-    "PC": False,
-    "Mobile": False,
-    "Console": False,
+
+ROLE_SPECS = {
+    "Founder": {
+        "emoji": "👑",
+        "colour": 0xF1C40F,
+        "hoist": True,
+        "permissions": {"administrator": True},
+    },
+    "Developer": {
+        "emoji": "🛠️",
+        "colour": 0x3498DB,
+        "hoist": True,
+        "permissions": {
+            "view_audit_log": True,
+            "manage_channels": True,
+            "manage_webhooks": True,
+            "manage_threads": True,
+        },
+    },
+    "Community Manager": {
+        "emoji": "🛡️",
+        "colour": 0x9B59B6,
+        "hoist": True,
+        "permissions": {
+            "view_audit_log": True,
+            "manage_channels": True,
+            "manage_messages": True,
+            "manage_threads": True,
+            "manage_nicknames": True,
+            "moderate_members": True,
+            "manage_events": True,
+        },
+    },
+    "Moderator": {
+        "emoji": "🔨",
+        "colour": 0xE74C3C,
+        "hoist": True,
+        "permissions": {
+            "view_audit_log": True,
+            "kick_members": True,
+            "ban_members": True,
+            "manage_messages": True,
+            "manage_threads": True,
+            "manage_nicknames": True,
+            "moderate_members": True,
+        },
+    },
+    "Helper": {
+        "emoji": "🤝",
+        "colour": 0x2ECC71,
+        "hoist": True,
+        "permissions": {
+            "manage_messages": True,
+            "manage_threads": True,
+        },
+    },
+    "Tester": {
+        "emoji": "🧪",
+        "colour": 0x1ABC9C,
+        "hoist": True,
+        "permissions": {},
+    },
+    "Early Crew": {
+        "emoji": "💎",
+        "colour": 0xE67E22,
+        "hoist": True,
+        "permissions": {},
+    },
+    "Bug Hunter": {
+        "emoji": "🐛",
+        "colour": 0x7CB342,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Content Creator": {
+        "emoji": "🎬",
+        "colour": 0xE91E63,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Contributor": {
+        "emoji": "💡",
+        "colour": 0x00BCD4,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Member": {
+        "emoji": "✅",
+        "colour": 0x95A5A6,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Update Ping": {
+        "emoji": "📢",
+        "colour": 0x5865F2,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Playtest Ping": {
+        "emoji": "🧪",
+        "colour": 0x57F287,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Event Ping": {
+        "emoji": "🎉",
+        "colour": 0xFEE75C,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Sneak Peek Ping": {
+        "emoji": "👀",
+        "colour": 0xEB459E,
+        "hoist": False,
+        "permissions": {},
+    },
+    "PC": {
+        "emoji": "🖥️",
+        "colour": 0x607D8B,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Mobile": {
+        "emoji": "📱",
+        "colour": 0x4CAF50,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Console": {
+        "emoji": "🎮",
+        "colour": 0x673AB7,
+        "hoist": False,
+        "permissions": {},
+    },
 }
+
+ROLE_DEFS = {name: spec["hoist"] for name, spec in ROLE_SPECS.items()}
+
 
 SELF_ROLES = [
     ("Update Ping", "📢"),
@@ -89,8 +207,19 @@ def safe_name(value: str) -> str:
     return value[:50] or "member"
 
 
+def role_display_name(name: str) -> str:
+    spec = ROLE_SPECS.get(name)
+    if not spec:
+        return name
+    return f"{spec['emoji']} {name}"
+
+
 def find_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
-    return discord.utils.get(guild.roles, name=name)
+    display_name = role_display_name(name)
+    return (
+        discord.utils.get(guild.roles, name=display_name)
+        or discord.utils.get(guild.roles, name=name)
+    )
 
 
 def find_text(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
@@ -106,11 +235,16 @@ def find_category(guild: discord.Guild, name: str) -> Optional[discord.CategoryC
 
 
 def is_staff(member: discord.Member) -> bool:
+    staff_names = set(STAFF_ROLE_NAMES)
+    staff_display_names = {role_display_name(name) for name in STAFF_ROLE_NAMES}
     return (
         member.guild.owner_id == member.id
         or member.guild_permissions.administrator
         or member.guild_permissions.manage_guild
-        or any(role.name in STAFF_ROLE_NAMES for role in member.roles)
+        or any(
+            role.name in staff_names or role.name in staff_display_names
+            for role in member.roles
+        )
     )
 
 
@@ -346,11 +480,42 @@ GUILD = discord.Object(id=GUILD_ID)
 setup_lock = asyncio.Lock()
 
 
+def build_permissions(spec):
+    permissions = discord.Permissions.none()
+    for permission_name, enabled in spec.get("permissions", {}).items():
+        if hasattr(permissions, permission_name):
+            setattr(permissions, permission_name, enabled)
+    return permissions
+
+
 async def ensure_role(guild: discord.Guild, name: str, hoist: bool = False):
+    spec = ROLE_SPECS.get(name, {
+        "emoji": "",
+        "colour": 0,
+        "hoist": hoist,
+        "permissions": {},
+    })
+    display_name = role_display_name(name)
+    permissions = build_permissions(spec)
+    colour = discord.Colour(spec.get("colour", 0))
+    role_icon_supported = "ROLE_ICONS" in guild.features
+
     existing = find_role(guild, name)
+    kwargs = {
+        "name": display_name,
+        "permissions": permissions,
+        "colour": colour,
+        "hoist": spec.get("hoist", hoist),
+        "mentionable": False,
+        "reason": "Smash & Steal role setup",
+    }
+    if role_icon_supported and spec.get("emoji"):
+        kwargs["display_icon"] = spec["emoji"]
+
     if existing:
-        return existing
-    return await guild.create_role(name=name, hoist=hoist, reason="Smash & Steal setup")
+        return await existing.edit(**kwargs)
+
+    return await guild.create_role(**kwargs)
 
 
 async def ensure_category(guild: discord.Guild, name: str, overwrites=None):
@@ -456,11 +621,12 @@ async def setup_server(guild: discord.Guild, progress=None):
     await tick("Starting setup...", True)
 
     for name, hoist in ROLE_DEFS.items():
-        if not find_role(guild, name):
-            await ensure_role(guild, name, hoist)
-            created.append(f"role:{name}")
+        existed = find_role(guild, name)
+        role = await ensure_role(guild, name, hoist)
+        if not existed:
+            created.append(f"role:{role.name}")
         done["roles"] += 1
-        await tick(f"Role: {name}")
+        await tick(f"Role: {role.name}")
 
     category_specs = [
         ("start", "🚪 START HERE", None),
@@ -765,6 +931,73 @@ async def emojis_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="rolesetup",
+    description="Apply Smash & Steal role names, colours and permissions",
+    guild=GUILD,
+)
+async def rolesetup_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    updated = []
+    failed = []
+    skipped = []
+
+    for name, spec in ROLE_SPECS.items():
+        role = find_role(guild, name)
+        if role and role.managed:
+            skipped.append(f"{name} (managed role)")
+            continue
+
+        if role and guild.me and role >= guild.me.top_role:
+            failed.append(f"{name} (role is above or equal to the bot role)")
+            continue
+
+        try:
+            result = await ensure_role(guild, name, spec["hoist"])
+            updated.append(result.name)
+            await asyncio.sleep(0.25)
+        except discord.Forbidden:
+            failed.append(f"{name} (Missing Access / Manage Roles)")
+        except discord.HTTPException as exc:
+            failed.append(f"{name} (HTTP {exc.status})")
+
+    role_icons = "ROLE_ICONS" in guild.features
+    lines = [
+        "## ✅ Role setup finished",
+        f"Updated or created: **{len(updated)}**",
+        f"Skipped: **{len(skipped)}**",
+        f"Failed: **{len(failed)}**",
+        "",
+        f"Actual Discord role icons available: **{'Yes' if role_icons else 'No'}**",
+        "Every managed role still gets an emoji in its role name.",
+    ]
+
+    if failed:
+        lines.append(
+            "\n**Could not update:**\n"
+            + "\n".join(f"• {item}" for item in failed[:20])
+        )
+    if skipped:
+        lines.append(
+            "\n**Skipped:**\n"
+            + "\n".join(f"• {item}" for item in skipped[:20])
+        )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(
     name="panels",
     description="Post Verify, role picker and ticket panels",
     guild=GUILD,
@@ -813,6 +1046,7 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**Commands**\n"
         "`/setup` create missing server structure\n"
+        "`/rolesetup` apply role colours, emojis and permissions\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
