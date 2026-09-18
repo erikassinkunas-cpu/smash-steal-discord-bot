@@ -1,10 +1,15 @@
+import asyncio
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import discord
 
 from moderation_store import ModerationError, ModerationStore
-from moderation_v2 import classify_message, timeout_minutes
+from moderation_v2 import ModerationV2, classify_message, install_moderation, timeout_minutes
 
 
 class ModerationStoreTests(unittest.TestCase):
@@ -145,6 +150,41 @@ class AutoModRuleTests(unittest.TestCase):
         for warnings, minutes in expected.items():
             with self.subTest(warnings=warnings):
                 self.assertEqual(timeout_minutes(warnings), minutes)
+
+
+class DiscordIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commands_register(self):
+        client = discord.Client(intents=discord.Intents.none())
+        client.tree = discord.app_commands.CommandTree(client)
+        ns = {
+            "bot": client,
+            "GUILD_ID": 1,
+            "is_staff": lambda member: False,
+            "send_mod_log": lambda *args, **kwargs: None,
+        }
+        controller = install_moderation(ns)
+        self.assertIs(controller, install_moderation(ns))
+        commands = client.tree.get_commands(guild=discord.Object(id=1))
+        self.assertEqual(
+            {command.name for command in commands},
+            {"warn", "warnings", "clearwarn", "automod-status"},
+        )
+        await client.close()
+
+    async def test_railway_requires_volume(self):
+        client = discord.Client(intents=discord.Intents.none())
+        controller = ModerationV2(
+            {
+                "bot": client,
+                "GUILD_ID": 1,
+                "is_staff": lambda member: False,
+                "send_mod_log": lambda *args, **kwargs: None,
+            }
+        )
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_ID": "test"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                await controller.prepare()
+        await client.close()
 
 
 if __name__ == "__main__":
