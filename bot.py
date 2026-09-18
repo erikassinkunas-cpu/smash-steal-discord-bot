@@ -965,77 +965,112 @@ def staff_roles(guild: discord.Guild):
     return [role for name in STAFF_ROLE_NAMES if (role := find_role(guild, name))]
 
 
-async def allow_bot(channel):
-    if channel.guild.me:
-        await channel.set_permissions(
-            channel.guild.me,
+def bot_permission_overwrite(channel):
+    if isinstance(channel, discord.VoiceChannel):
+        return discord.PermissionOverwrite(
             view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            add_reactions=True,
-            manage_messages=True,
+            connect=True,
+            speak=True,
             manage_channels=True,
         )
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        add_reactions=True,
+        manage_messages=True,
+        manage_channels=True,
+    )
+
+
+async def replace_channel_overwrites(channel, overwrites):
+    guild = channel.guild
+    if guild.me:
+        overwrites[guild.me] = bot_permission_overwrite(channel)
+    await channel.edit(
+        overwrites=overwrites,
+        reason="Smash & Steal verification gate",
+    )
 
 
 async def set_hidden_until_member(channel, read_only=False):
     guild = channel.guild
-    await channel.set_permissions(guild.default_role, view_channel=False)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False)
+    }
     for role in access_roles(guild):
-        await channel.set_permissions(
-            role,
-            view_channel=True,
-            read_message_history=True,
-            send_messages=False if read_only else True,
-        )
-    await allow_bot(channel)
+        if isinstance(channel, discord.VoiceChannel):
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+            )
+        else:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False if read_only else True,
+            )
+    await replace_channel_overwrites(channel, overwrites)
 
 
 async def set_staff_only(channel):
     guild = channel.guild
-    await channel.set_permissions(guild.default_role, view_channel=False)
-    member = find_role(guild, "Member")
-    if member:
-        await channel.set_permissions(member, view_channel=False)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False)
+    }
     for role in staff_roles(guild):
-        await channel.set_permissions(
-            role,
-            view_channel=True,
-            read_message_history=True,
-            send_messages=True,
-            connect=True if isinstance(channel, discord.VoiceChannel) else None,
-            speak=True if isinstance(channel, discord.VoiceChannel) else None,
-        )
-    await allow_bot(channel)
+        if isinstance(channel, discord.VoiceChannel):
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+            )
+        else:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+            )
+    await replace_channel_overwrites(channel, overwrites)
 
 
 async def set_tester_only(channel):
     guild = channel.guild
-    await channel.set_permissions(guild.default_role, view_channel=False)
-    for role in access_roles(guild):
-        await channel.set_permissions(role, view_channel=False)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False)
+    }
+
     tester = find_role(guild, "Tester")
     if tester:
         if isinstance(channel, discord.VoiceChannel):
-            await channel.set_permissions(tester, view_channel=True, connect=True, speak=True)
+            overwrites[tester] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+            )
         else:
-            await channel.set_permissions(
-                tester,
+            overwrites[tester] = discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
                 send_messages=True,
             )
+
     for role in staff_roles(guild):
         if isinstance(channel, discord.VoiceChannel):
-            await channel.set_permissions(role, view_channel=True, connect=True, speak=True)
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+            )
         else:
-            await channel.set_permissions(
-                role,
+            overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
                 send_messages=True,
             )
-    await allow_bot(channel)
+
+    await replace_channel_overwrites(channel, overwrites)
 
 
 async def apply_verification_gate(guild: discord.Guild):
@@ -1051,22 +1086,23 @@ async def apply_verification_gate(guild: discord.Guild):
     for channel in [start_here, rules, verify]:
         if not channel:
             continue
-        await channel.set_permissions(
-            guild.default_role,
-            view_channel=True,
-            read_message_history=True,
-            send_messages=False,
-            add_reactions=(channel == verify),
-        )
-        for role in access_roles(guild):
-            await channel.set_permissions(
-                role,
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
                 send_messages=False,
                 add_reactions=(channel == verify),
             )
-        await allow_bot(channel)
+        }
+        for role in access_roles(guild):
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+                add_reactions=(channel == verify),
+            )
+        await replace_channel_overwrites(channel, overwrites)
 
     if choose_roles:
         await set_hidden_until_member(choose_roles, read_only=True)
@@ -1107,9 +1143,7 @@ async def apply_verification_gate(guild: discord.Guild):
             or discord.utils.get(guild.voice_channels, name=base_name)
         )
         if channel:
-            await channel.set_permissions(guild.default_role, view_channel=False)
-            for role in access_roles(guild):
-                await channel.set_permissions(role, view_channel=True, connect=True, speak=True)
+            await set_hidden_until_member(channel, read_only=False)
 
     playtest_room = (
         discord.utils.get(guild.voice_channels, name=VOICE_NAMES["Playtest Room"])
@@ -1126,16 +1160,29 @@ async def apply_verification_gate(guild: discord.Guild):
         await set_staff_only(team_room)
 
     entry_ids = {x.id for x in [start_here, rules, verify] if x}
-    special = {x.id for x in [choose_roles, tester_chat, playtest_room, team_room] if x}
+    managed_ids = set(entry_ids)
+    for name in CHANNEL_NAMES:
+        channel = find_text(guild, name)
+        if channel:
+            managed_ids.add(channel.id)
+    for display_name in VOICE_NAMES.values():
+        channel = discord.utils.get(guild.voice_channels, name=display_name)
+        if channel:
+            managed_ids.add(channel.id)
 
     for channel in guild.channels:
         if isinstance(channel, discord.CategoryChannel):
             continue
-        if channel.id in entry_ids or channel.id in special:
+        if channel.id in managed_ids:
             continue
         if channel.category and channel.category.name in {"🔒 TEAM", "🎫 TICKETS"}:
             continue
-        await channel.set_permissions(guild.default_role, view_channel=False)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        }
+        for role in access_roles(guild):
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+        await replace_channel_overwrites(channel, overwrites)
 
 
 async def upsert_bot_message(channel, marker, content, view=None, reaction=None):
