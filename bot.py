@@ -265,6 +265,7 @@ READ_ONLY_CHANNELS = {
     "known-issues",
     "welcome",
     "goodbye",
+    "levels",
 }
 
 
@@ -283,6 +284,7 @@ CHANNEL_NAMES = {
     "find-a-crew": "🤝・find-a-crew",
     "polls-and-events": "🎉・polls-and-events",
     "hall-of-fame": "🏆・hall-of-fame",
+    "levels": "⭐・levels",
     "help-and-faq": "❓・help-and-faq",
     "open-ticket": "🎫・open-ticket",
     "bug-reports": "🐛・bug-reports",
@@ -1059,7 +1061,7 @@ async def setup_server(guild: discord.Guild, progress=None):
     totals = {
         "roles": len(ROLE_DEFS),
         "categories": 7,
-        "channels": 30,
+        "channels": 31,
         "permissions": 2,
     }
     done = {key: 0 for key in totals}
@@ -1127,6 +1129,7 @@ async def setup_server(guild: discord.Guild, progress=None):
         (community, "find-a-crew", False, True),
         (community, "polls-and-events", False, True),
         (community, "hall-of-fame", True, False),
+        (community, "levels", True, True),
         (support, "help-and-faq", True, False),
         (support, "open-ticket", True, False),
         (support, "bug-reports", False, True),
@@ -1605,6 +1608,7 @@ async def ensure_entry_channels(guild: discord.Guild):
     await ensure_text(guild, start_category, "choose-roles", True, True)
     await ensure_text(guild, community, "welcome", True, True)
     await ensure_text(guild, community, "goodbye", True, True)
+    await ensure_text(guild, community, "levels", True, True)
     await ensure_text(guild, support, "open-ticket", True, True)
 
 
@@ -3335,6 +3339,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/serveraudit` audit roles, channels, permissions and panels\n"
         "`/cleanup` safely clean duplicate roles/channels/categories\n"
         "`/kick`, `/ban`, `/unban`, `/timeout`, `/untimeout` moderation\n"
+        "`/rank`, `/leaderboard` XP and levels\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
