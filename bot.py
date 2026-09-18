@@ -1,6 +1,8 @@
 import os
 import re
+import io
 import asyncio
+from datetime import timedelta
 from typing import Optional
 
 import discord
@@ -289,6 +291,8 @@ CHANNEL_NAMES = {
     "staff-chat": "🛠・staff-chat",
     "mod-alerts": "🛡・mod-alerts",
     "bot-logs": "🤖・bot-logs",
+    "mod-logs": "🧾・mod-logs",
+    "ticket-logs": "📁・ticket-logs",
 }
 
 VOICE_NAMES = {
@@ -638,6 +642,7 @@ bot = SmashStealBot()
 GUILD = discord.Object(id=GUILD_ID)
 setup_lock = asyncio.Lock()
 startup_sync_lock = asyncio.Lock()
+ticket_counter_lock = asyncio.Lock()
 STARTUP_SYNC_DONE = False
 VERIFY_MESSAGE_ID = None
 
@@ -837,7 +842,7 @@ async def setup_server(guild: discord.Guild, progress=None):
     totals = {
         "roles": len(ROLE_DEFS),
         "categories": 7,
-        "channels": 28,
+        "channels": 30,
         "permissions": 2,
     }
     done = {key: 0 for key in totals}
@@ -915,6 +920,8 @@ async def setup_server(guild: discord.Guild, progress=None):
         (team, "staff-chat", False, False),
         (team, "mod-alerts", False, False),
         (team, "bot-logs", False, False),
+        (team, "mod-logs", False, False),
+        (team, "ticket-logs", False, False),
     ]
 
     for category, name, read_only, member_only in channel_defs:
@@ -1186,7 +1193,7 @@ async def apply_verification_gate(guild: discord.Guild):
     if tester_chat:
         await set_tester_only(tester_chat)
 
-    for name in ["staff-chat", "mod-alerts", "bot-logs"]:
+    for name in ["staff-chat", "mod-alerts", "bot-logs", "mod-logs", "ticket-logs"]:
         channel = find_text(guild, name)
         if channel:
             await set_staff_only(channel)
@@ -1369,6 +1376,12 @@ async def ensure_entry_channels(guild: discord.Guild):
     if not support:
         support = await ensure_category(guild, "🛟 SUPPORT")
 
+    team = find_category(guild, "🔒 TEAM")
+    if not team:
+        team = await ensure_category(guild, "🔒 TEAM", overwrites=staff_overwrites(guild))
+
+    await ensure_text(guild, team, "mod-logs", False, False)
+    await ensure_text(guild, team, "ticket-logs", False, False)
     await ensure_text(guild, start_category, "start-here", True, False)
     await ensure_text(guild, start_category, "rules", True, False)
     await ensure_text(guild, start_category, "verify", True, False)
