@@ -320,7 +320,10 @@ async def ensure_category(guild: discord.Guild, name: str, overwrites=None):
     existing = find_category(guild, name)
     if existing:
         return existing
-    return await guild.create_category(name, overwrites=overwrites, reason="Smash & Steal setup")
+    kwargs = {"reason": "Smash & Steal setup"}
+    if overwrites is not None:
+        kwargs["overwrites"] = overwrites
+    return await guild.create_category(name, **kwargs)
 
 
 async def ensure_text(guild, category, name, read_only=False, member_only=False):
