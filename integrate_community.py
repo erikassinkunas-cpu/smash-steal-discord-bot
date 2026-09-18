@@ -7,9 +7,11 @@ import ast
 from pathlib import Path
 
 ANCHOR = 'bot.run(TOKEN, log_handler=None)'
-REPLACEMENT = '''# SAS Community V2 integration
+REPLACEMENT = '''# SAS extensions integration
 from community import install_community
+from moderation_v2 import install_moderation
 install_community(globals())
+install_moderation(globals())
 bot.run(TOKEN)
 '''
 
@@ -34,4 +36,4 @@ def integrate(source):
 if __name__ == '__main__':
     path = Path(__file__).with_name('bot.py')
     path.write_text(integrate(path.read_text(encoding='utf-8')), encoding='utf-8')
-    print('COMMUNITY BUILD INTEGRATION OK', flush=True)
+    print('SAS EXTENSIONS BUILD INTEGRATION OK', flush=True)
