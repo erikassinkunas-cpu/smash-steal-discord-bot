@@ -1954,6 +1954,314 @@ async def panels_cmd(interaction: discord.Interaction):
         )
 
 
+def normalise_channel_name(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^[^A-Za-z0-9]+", "", value)
+    value = value.replace("・", "-").replace("_", "-").replace(" ", "-")
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value.casefold()
+
+
+def duplicate_groups(items, normalizer):
+    groups = {}
+    for item in items:
+        key = normalizer(item.name)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(item)
+    return {
+        key: values
+        for key, values in groups.items()
+        if len(values) > 1
+    }
+
+
+async def find_core_bot_messages(channel, marker):
+    matches = []
+    try:
+        async for message in channel.history(limit=100):
+            if message.author == channel.guild.me and message.content.startswith(marker):
+                matches.append(message)
+    except discord.HTTPException:
+        pass
+    return matches
+
+
+async def server_audit(guild: discord.Guild):
+    issues = []
+    warnings = []
+    ok = []
+
+    # Duplicates
+    role_dupes = duplicate_groups(
+        [role for role in guild.roles if not role.is_default() and not role.managed],
+        normalise_role_name,
+    )
+    text_dupes = duplicate_groups(guild.text_channels, normalise_channel_name)
+    voice_dupes = duplicate_groups(guild.voice_channels, normalise_channel_name)
+    category_dupes = duplicate_groups(guild.categories, normalise_channel_name)
+
+    if role_dupes:
+        for key, values in role_dupes.items():
+            issues.append("Duplicate roles: " + ", ".join(role.name for role in values))
+    else:
+        ok.append("No duplicate normal roles")
+
+    if text_dupes:
+        for key, values in text_dupes.items():
+            issues.append("Duplicate text channels: " + ", ".join(ch.name for ch in values))
+    else:
+        ok.append("No duplicate text channels")
+
+    if voice_dupes:
+        for key, values in voice_dupes.items():
+            issues.append("Duplicate voice channels: " + ", ".join(ch.name for ch in values))
+    else:
+        ok.append("No duplicate voice channels")
+
+    if category_dupes:
+        for key, values in category_dupes.items():
+            issues.append("Duplicate categories: " + ", ".join(ch.name for ch in values))
+    else:
+        ok.append("No duplicate categories")
+
+    # Required roles
+    role_bad = []
+    for name in ROLE_SPECS:
+        role, role_issues = role_audit(guild, name)
+        if role_issues:
+            role_bad.append(f"{role_display_name(name)}: {', '.join(role_issues)}")
+    if role_bad:
+        issues.extend("Role: " + x for x in role_bad)
+    else:
+        ok.append(f"All {len(ROLE_SPECS)} managed roles match spec")
+
+    # Required categories
+    for display_name in CATEGORY_NAMES.values():
+        if not discord.utils.get(guild.categories, name=display_name):
+            issues.append(f"Missing category: {display_name}")
+
+    # Required text channels
+    for base_name, display_name in CHANNEL_NAMES.items():
+        channel = find_text(guild, base_name)
+        if not channel:
+            issues.append(f"Missing text channel: {display_name}")
+        elif channel.name != display_name:
+            warnings.append(f"Channel name differs: {channel.name} -> {display_name}")
+
+    # Required voice channels
+    for base_name, display_name in VOICE_NAMES.items():
+        channel = (
+            discord.utils.get(guild.voice_channels, name=display_name)
+            or discord.utils.get(guild.voice_channels, name=base_name)
+        )
+        if not channel:
+            issues.append(f"Missing voice channel: {display_name}")
+        elif channel.name != display_name:
+            warnings.append(f"Voice name differs: {channel.name} -> {display_name}")
+
+    # Verification gate. New users should see only start-here, rules, verify.
+    entry_names = {"start-here", "rules", "verify"}
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+
+        base_match = None
+        for base_name in CHANNEL_NAMES:
+            if find_text(guild, base_name) and find_text(guild, base_name).id == channel.id:
+                base_match = base_name
+                break
+
+        everyone_can_view = channel.permissions_for(guild.default_role).view_channel
+        if base_match in entry_names:
+            if not everyone_can_view:
+                issues.append(f"Entry channel hidden from @everyone: {channel.name}")
+        else:
+            if everyone_can_view:
+                issues.append(f"Unverified users can still see: {channel.name}")
+
+    # Read-only channels.
+    member = find_role(guild, "Member")
+    writer_roles = broadcast_writer_roles(guild)
+    if member:
+        for name in READ_ONLY_CHANNELS:
+            channel = find_text(guild, name)
+            if not channel:
+                continue
+            member_perms = channel.permissions_for(member)
+            if not member_perms.view_channel:
+                issues.append(f"Member cannot view read-only channel: {channel.name}")
+            if member_perms.send_messages:
+                issues.append(f"Member can write in read-only channel: {channel.name}")
+            if member_perms.create_public_threads or member_perms.send_messages_in_threads:
+                issues.append(f"Member can use threads in read-only channel: {channel.name}")
+
+            for role in writer_roles:
+                perms = channel.permissions_for(role)
+                if not perms.view_channel or not perms.send_messages:
+                    warnings.append(f"Staff role cannot post in {channel.name}: {role.name}")
+
+    # Normal writable channels.
+    for name in [
+        "general", "clips-and-loot", "find-a-crew", "polls-and-events",
+        "bug-reports", "suggestions",
+    ]:
+        channel = find_text(guild, name)
+        if channel and member:
+            perms = channel.permissions_for(member)
+            if not perms.view_channel or not perms.send_messages:
+                issues.append(f"Member cannot write in normal channel: {channel.name}")
+
+    # Tester/private channels.
+    tester = find_role(guild, "Tester")
+    tester_chat = find_text(guild, "tester-chat")
+    if tester_chat and member and tester:
+        if tester_chat.permissions_for(member).view_channel:
+            issues.append("Member can see tester-chat")
+        tester_perms = tester_chat.permissions_for(tester)
+        if not tester_perms.view_channel or not tester_perms.send_messages:
+            issues.append("Tester cannot use tester-chat")
+
+    for name in ["staff-chat", "mod-alerts", "bot-logs"]:
+        channel = find_text(guild, name)
+        if channel and member and channel.permissions_for(member).view_channel:
+            issues.append(f"Member can see staff-only channel: {channel.name}")
+
+    # Core messages and panels.
+    core_checks = [
+        ("start-here", "## 👋 Welcome to Smash & Steal"),
+        ("rules", "## 📜 Smash & Steal Rules"),
+        ("verify", "## ✅ Verify"),
+        ("choose-roles", "## 🎭 Choose Your Roles"),
+        ("open-ticket", "## 🎫 Support"),
+    ]
+
+    core_messages = {}
+    for channel_name, marker in core_checks:
+        channel = find_text(guild, channel_name)
+        if not channel:
+            continue
+        messages = await find_core_bot_messages(channel, marker)
+        core_messages[channel_name] = messages
+        if not messages:
+            issues.append(f"Missing core bot message in {channel.name}")
+        elif len(messages) > 1:
+            warnings.append(f"Duplicate core bot messages in {channel.name}: {len(messages)}")
+
+    verify_messages = core_messages.get("verify", [])
+    if verify_messages:
+        verify_message = verify_messages[0]
+        has_check = any(str(reaction.emoji) == "✅" for reaction in verify_message.reactions)
+        if not has_check:
+            issues.append("Verify message is missing ✅ reaction")
+        if not verify_message.components:
+            issues.append("Verify message is missing Get Member button")
+        else:
+            ok.append("Verify reaction/button present")
+
+    role_messages = core_messages.get("choose-roles", [])
+    if role_messages:
+        if not role_messages[0].components:
+            issues.append("choose-roles has no buttons")
+        else:
+            component_count = sum(len(row.children) for row in role_messages[0].components)
+            if component_count < len(SELF_ROLES):
+                issues.append(
+                    f"choose-roles has only {component_count}/{len(SELF_ROLES)} role buttons"
+                )
+            else:
+                ok.append(f"choose-roles has {component_count} buttons")
+
+    # Welcome/goodbye + runtime flags
+    welcome = find_text(guild, "welcome")
+    goodbye = find_text(guild, "goodbye")
+    if welcome and goodbye and ENABLE_MEMBER_EVENTS and bot.intents.members:
+        ok.append("Welcome/goodbye member events enabled")
+    else:
+        issues.append(
+            "Welcome/goodbye event system is not fully enabled "
+            f"(channels={bool(welcome and goodbye)}, env={ENABLE_MEMBER_EVENTS}, intent={bot.intents.members})"
+        )
+
+    # Bot permissions relevant to this server.
+    me = guild.me
+    if me:
+        required_bot_permissions = {
+            "manage_roles": me.guild_permissions.manage_roles,
+            "manage_channels": me.guild_permissions.manage_channels,
+            "send_messages": me.guild_permissions.send_messages,
+            "read_message_history": me.guild_permissions.read_message_history,
+            "add_reactions": me.guild_permissions.add_reactions,
+        }
+        missing = [name for name, value in required_bot_permissions.items() if not value]
+        if missing:
+            issues.append("Bot missing guild permissions: " + ", ".join(missing))
+        else:
+            ok.append("Bot has required guild permissions")
+
+    return {
+        "issues": issues,
+        "warnings": warnings,
+        "ok": ok,
+        "counts": {
+            "roles": len(guild.roles),
+            "categories": len(guild.categories),
+            "text_channels": len(guild.text_channels),
+            "voice_channels": len(guild.voice_channels),
+            "members": guild.member_count,
+        },
+    }
+
+
+def format_server_audit(result, max_items=35):
+    counts = result["counts"]
+    issues = result["issues"]
+    warnings = result["warnings"]
+    lines = [
+        "## 🔎 Smash & Steal Server Audit",
+        f"Roles: **{counts['roles']}** | Categories: **{counts['categories']}** | "
+        f"Text: **{counts['text_channels']}** | Voice: **{counts['voice_channels']}**",
+        f"Problems: **{len(issues)}** | Warnings: **{len(warnings)}**",
+    ]
+
+    if issues:
+        lines.append(
+            "\n**❌ Problems**\n"
+            + "\n".join(f"• {item}" for item in issues[:max_items])
+        )
+    if warnings:
+        lines.append(
+            "\n**⚠️ Warnings**\n"
+            + "\n".join(f"• {item}" for item in warnings[:max_items])
+        )
+    if not issues and not warnings:
+        lines.append("\n✅ No problems found in the managed server configuration.")
+
+    return "\n".join(lines)
+
+
+@bot.tree.command(
+    name="serveraudit",
+    description="Audit channels, roles, permissions, verification and panels",
+    guild=GUILD,
+)
+async def serveraudit_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await server_audit(interaction.guild)
+    await interaction.edit_original_response(content=format_server_audit(result))
+
+
 @bot.tree.command(
     name="status",
     description="Check whether the bot is online",
@@ -1979,6 +2287,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/roleaudit` check every managed role\n"
         "`/entrysetup` fix verification gate and entry channels\n"
         "`/channelpermissions` enforce read-only channel permissions\n"
+        "`/serveraudit` audit roles, channels, permissions and panels\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
@@ -2045,6 +2354,19 @@ async def on_ready():
             try:
                 await ensure_entry_system(guild)
                 print("ENTRY AUTO-SYNC DONE", flush=True)
+
+                audit = await server_audit(guild)
+                print(
+                    "SERVER AUDIT | "
+                    f"issues={len(audit['issues'])} | "
+                    f"warnings={len(audit['warnings'])} | "
+                    f"counts={audit['counts']}",
+                    flush=True,
+                )
+                for item in audit["issues"]:
+                    print(f"SERVER AUDIT ISSUE | {item}", flush=True)
+                for item in audit["warnings"]:
+                    print(f"SERVER AUDIT WARNING | {item}", flush=True)
             except Exception as exc:
                 print(
                     f"ENTRY AUTO-SYNC FAILED | {type(exc).__name__}: {exc}",
