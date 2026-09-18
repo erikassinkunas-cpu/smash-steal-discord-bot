@@ -29,6 +29,24 @@ ELIGIBLE_CHANNELS = (
 MIN_TEXT_LENGTH = 5
 BAR_LENGTH = 12
 
+REWARD_ROLES = (
+    (5, "Active", "🌱"),
+    (10, "Regular", "🔥"),
+    (20, "Veteran", "💎"),
+    (30, "Elite", "🏆"),
+    (50, "Legend", "👑"),
+)
+
+
+def unlocked_rewards(level: int):
+    level = max(0, int(level))
+    return [reward for reward in REWARD_ROLES if level >= reward[0]]
+
+
+def next_reward(level: int):
+    level = max(0, int(level))
+    return next((reward for reward in REWARD_ROLES if level < reward[0]), None)
+
 
 def progress_bar(progress: int, needed: int) -> str:
     if needed <= 0:
@@ -95,7 +113,13 @@ class LevelsV1:
             f"Messages need at least **{MIN_TEXT_LENGTH} characters**, unless they contain an attachment. "
             f"Repeating the same message within **{DUPLICATE_WINDOW_SECONDS // 60} minutes** gives no XP.\n"
             "Deleted, blocked, bot and ticket messages do not earn XP.\n\n"
-            "Use **/rank** to see your progress and **/leaderboard** for the server top 10."
+            "**Level rewards**\n"
+            "🌱 Level 5 — Active\n"
+            "🔥 Level 10 — Regular\n"
+            "💎 Level 20 — Veteran\n"
+            "🏆 Level 30 — Elite\n"
+            "👑 Level 50 — Legend\n\n"
+            "Reward roles are cosmetic and cumulative. Use **/rank**, **/rewards** and **/leaderboard**."
         )
 
         existing = None
@@ -133,14 +157,19 @@ class LevelsV1:
                 raise RuntimeError("The levels channel is missing.")
 
             await self.upsert_panel(level_channel)
+            reward_sync = await self.sync_all_rewards(guild)
             stats = await asyncio.to_thread(self.store.stats, self.guild_id)
             self.ready = True
             LOG.info(
-                "LEVELS READY channel=%s xp=%s cooldown=%ss participants=%s integrity=%s",
+                "LEVELS READY channel=%s xp=%s cooldown=%ss participants=%s "
+                "reward_roles=%s/%s reward_changes=%s integrity=%s",
                 level_channel.id,
                 XP_PER_MESSAGE,
                 XP_COOLDOWN_SECONDS,
                 stats["members"],
+                reward_sync["roles_found"],
+                len(REWARD_ROLES),
+                reward_sync["changes"],
                 stats["integrity"],
             )
 
@@ -152,7 +181,79 @@ class LevelsV1:
         role = self.ns["find_role"](member.guild, "Member")
         return bool(role and role in member.roles)
 
-    async def announce_level(self, member: discord.Member, result):
+    def reward_role_objects(self, guild: discord.Guild):
+        rewards = []
+        for threshold, name, emoji in REWARD_ROLES:
+            role = self.ns["find_role"](guild, name)
+            if role:
+                rewards.append((threshold, name, emoji, role))
+        return rewards
+
+    async def sync_reward_roles(self, member: discord.Member, level: int):
+        if member.bot:
+            return [], []
+
+        to_add = []
+        to_remove = []
+        for threshold, name, emoji, role in self.reward_role_objects(member.guild):
+            should_have = int(level) >= threshold
+            has_role = role in member.roles
+            if should_have and not has_role:
+                to_add.append(role)
+            elif not should_have and has_role:
+                to_remove.append(role)
+
+        added = []
+        removed = []
+        try:
+            if to_add:
+                await member.add_roles(
+                    *to_add,
+                    reason=f"Level reward sync: level {int(level)}",
+                )
+                added = [role.name for role in to_add]
+            if to_remove:
+                await member.remove_roles(
+                    *to_remove,
+                    reason=f"Level reward sync: level {int(level)}",
+                )
+                removed = [role.name for role in to_remove]
+        except discord.Forbidden:
+            LOG.warning(
+                "REWARD ROLE SYNC BLOCKED user=%s level=%s",
+                member.id,
+                level,
+            )
+        except discord.HTTPException:
+            LOG.exception(
+                "REWARD ROLE SYNC FAILED user=%s level=%s",
+                member.id,
+                level,
+            )
+        return added, removed
+
+    async def sync_all_rewards(self, guild: discord.Guild):
+        persisted = await asyncio.to_thread(self.store.levels, self.guild_id)
+        reward_objects = self.reward_role_objects(guild)
+        reward_ids = {role.id for _, _, _, role in reward_objects}
+        changes = 0
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            level = persisted.get(str(member.id), 0)
+            has_reward = any(role.id in reward_ids for role in member.roles)
+            if level <= 0 and not has_reward:
+                continue
+            added, removed = await self.sync_reward_roles(member, level)
+            changes += len(added) + len(removed)
+
+        return {
+            "roles_found": len(reward_objects),
+            "changes": changes,
+        }
+
+    async def announce_level(self, member: discord.Member, result, unlocked_roles=None):
         channel = self.bot.get_channel(self.level_channel_id) if self.level_channel_id else None
         if not isinstance(channel, discord.TextChannel):
             return
@@ -164,6 +265,12 @@ class LevelsV1:
             colour=discord.Colour(0xFEE75C),
             timestamp=discord.utils.utcnow(),
         )
+        if unlocked_roles:
+            embed.add_field(
+                name="🎁 Reward unlocked",
+                value="\n".join(f"**{name}**" for name in unlocked_roles),
+                inline=False,
+            )
         embed.add_field(
             name="Next level",
             value=f"{bar}\n{result['progress']} / {result['needed']} XP",
@@ -213,8 +320,16 @@ class LevelsV1:
         if not result:
             return
 
+        added_roles, _ = await self.sync_reward_roles(
+            message.author,
+            result["level"],
+        )
         if result["leveled_up"]:
-            await self.announce_level(message.author, result)
+            await self.announce_level(
+                message.author,
+                result,
+                unlocked_roles=added_roles,
+            )
 
     async def rank(
         self,
@@ -245,6 +360,70 @@ class LevelsV1:
             value=f"{bar}\n**{data['progress']:,} / {data['needed']:,} XP**",
             inline=False,
         )
+        unlocked = unlocked_rewards(data["level"])
+        current = (
+            f"{unlocked[-1][2]} {unlocked[-1][1]}"
+            if unlocked
+            else "No reward role yet"
+        )
+        upcoming = next_reward(data["level"])
+        next_text = (
+            f"{upcoming[2]} {upcoming[1]} at Level {upcoming[0]}"
+            if upcoming
+            else "All level rewards unlocked"
+        )
+        embed.add_field(name="Current reward", value=current, inline=True)
+        embed.add_field(name="Next reward", value=next_text, inline=True)
+        await respond(interaction, embed=embed, ephemeral=True)
+
+    async def rewards(
+        self,
+        interaction: discord.Interaction,
+        member: Optional[discord.Member] = None,
+    ):
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await respond(
+                interaction,
+                content="Use this command in the Smash & Steal server.",
+            )
+            return
+
+        target = member or interaction.user
+        if not isinstance(target, discord.Member) or target.bot:
+            await respond(
+                interaction,
+                content="That account does not participate in level rewards.",
+            )
+            return
+
+        data = await asyncio.to_thread(self.store.get, self.guild_id, target.id)
+        lines = []
+        for threshold, name, emoji in REWARD_ROLES:
+            status = "✅" if data["level"] >= threshold else "🔒"
+            lines.append(f"{status} **Level {threshold}** · {emoji} {name}")
+
+        upcoming = next_reward(data["level"])
+        footer = (
+            f"Next reward: {upcoming[2]} {upcoming[1]} at Level {upcoming[0]}"
+            if upcoming
+            else "All rewards unlocked."
+        )
+        embed = discord.Embed(
+            title=f"🎁 {target.display_name}'s Level Rewards",
+            description="\n".join(lines),
+            colour=discord.Colour(0x57F287),
+        )
+        embed.add_field(
+            name="Current level",
+            value=str(data["level"]),
+            inline=True,
+        )
+        embed.add_field(
+            name="Total XP",
+            value=f"{data['total_xp']:,}",
+            inline=True,
+        )
+        embed.set_footer(text=footer)
         await respond(interaction, embed=embed, ephemeral=True)
 
     async def leaderboard(self, interaction: discord.Interaction):
@@ -286,6 +465,12 @@ class LevelsV1:
             return
 
         stats = await asyncio.to_thread(self.store.stats, self.guild_id)
+        guild = interaction.guild
+        roles_found = (
+            len(self.reward_role_objects(guild))
+            if guild
+            else 0
+        )
         await respond(
             interaction,
             content=(
@@ -293,6 +478,7 @@ class LevelsV1:
                 f"XP per eligible message: **{XP_PER_MESSAGE}**\n"
                 f"Cooldown: **{XP_COOLDOWN_SECONDS}s**\n"
                 f"Duplicate window: **{DUPLICATE_WINDOW_SECONDS // 60} min**\n"
+                f"Reward roles: **{roles_found}/{len(REWARD_ROLES)}**\n"
                 f"Participants: **{stats['members']}**\n"
                 f"Total XP earned: **{stats['total_xp']:,}**\n"
                 f"Database: **{stats['integrity']}**"
@@ -331,6 +517,10 @@ class LevelsV1:
         )
         action = "added to" if sign > 0 else "removed from"
         actual_change = data["total_xp"] - data["before_total"]
+        reward_added, reward_removed = await self.sync_reward_roles(
+            member,
+            data["level"],
+        )
 
         await self.ns["send_mod_log"](
             interaction.guild,
@@ -341,6 +531,14 @@ class LevelsV1:
                 ("Change", f"{actual_change:+,} XP", True),
                 ("New total", f"{data['total_xp']:,} XP", True),
                 ("Level", data["level"], True),
+                (
+                    "Reward roles",
+                    (
+                        f"Added: {', '.join(reward_added) if reward_added else 'none'}\n"
+                        f"Removed: {', '.join(reward_removed) if reward_removed else 'none'}"
+                    ),
+                    False,
+                ),
                 ("Reason", discord.utils.escape_mentions(reason), False),
             ],
         )
@@ -400,6 +598,7 @@ def install_levels(ns):
 
     specs = [
         ("rank", "Show your level, XP and server rank", controller.rank, False),
+        ("rewards", "Show level reward roles and unlock progress", controller.rewards, False),
         ("leaderboard", "Show the top 10 members by XP", controller.leaderboard, False),
         ("level-status", "Show level system health and XP totals", controller.level_status, True),
         ("xp-add", "Add XP to a member", controller.xp_add, True),
