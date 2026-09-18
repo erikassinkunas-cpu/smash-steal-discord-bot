@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK",
+    "buildCommand": "python integrate_community.py && REQUIRE_DISCORD_TESTS=1 python -m unittest discover -s tests -v && python -m py_compile bot.py community.py community_store.py"
+  },
+  "deploy": {
+    "startCommand": "python -u bot.py",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
