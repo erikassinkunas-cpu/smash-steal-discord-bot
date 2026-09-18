@@ -12,7 +12,14 @@ from levels_store import (
     level_from_total,
     xp_for_next,
 )
-from levels_v1 import LevelsV1, install_levels, progress_bar
+from levels_v1 import (
+    REWARD_ROLES,
+    LevelsV1,
+    install_levels,
+    next_reward,
+    progress_bar,
+    unlocked_rewards,
+)
 
 
 class LevelMathTests(unittest.TestCase):
@@ -44,6 +51,22 @@ class LevelMathTests(unittest.TestCase):
             message_fingerprint("", ["a.png"]),
             message_fingerprint("", ["b.png"]),
         )
+
+    def test_reward_thresholds(self):
+        self.assertEqual(unlocked_rewards(4), [])
+        self.assertEqual(
+            [reward[1] for reward in unlocked_rewards(20)],
+            ["Active", "Regular", "Veteran"],
+        )
+        self.assertEqual(
+            [reward[0] for reward in REWARD_ROLES],
+            [5, 10, 20, 30, 50],
+        )
+
+    def test_next_reward(self):
+        self.assertEqual(next_reward(0)[:2], (5, "Active"))
+        self.assertEqual(next_reward(29)[:2], (30, "Elite"))
+        self.assertIsNone(next_reward(50))
 
 
 class LevelStoreTests(unittest.TestCase):
@@ -120,6 +143,13 @@ class LevelStoreTests(unittest.TestCase):
         self.assertEqual(stats["total_xp"], 100)
         self.assertEqual(stats["integrity"], "ok")
 
+    def test_persisted_levels_map(self):
+        self.store.adjust("1", "10", 100)
+        self.store.adjust("1", "20", 0)
+        levels = self.store.levels("1")
+        self.assertEqual(levels["10"], 1)
+        self.assertEqual(levels["20"], 0)
+
 
 class DiscordIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_register(self):
@@ -138,7 +168,7 @@ class DiscordIntegrationTests(unittest.IsolatedAsyncioTestCase):
         commands = client.tree.get_commands(guild=discord.Object(id=1))
         self.assertEqual(
             {command.name for command in commands},
-            {"rank", "leaderboard", "level-status", "xp-add", "xp-remove"},
+            {"rank", "rewards", "leaderboard", "level-status", "xp-add", "xp-remove"},
         )
         await client.close()
 
