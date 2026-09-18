@@ -492,6 +492,187 @@ class VerifyView(discord.ui.View):
             )
 
 
+def ticket_metadata(channel: discord.TextChannel):
+    topic = channel.topic or ""
+    owner_match = re.search(r"ticket-owner:(\d+)", topic)
+    type_match = re.search(r"type:([a-z-]+)", topic)
+    number_match = re.search(r"ticket-number:(\d+)", topic)
+    return {
+        "owner_id": int(owner_match.group(1)) if owner_match else None,
+        "type": type_match.group(1) if type_match else "unknown",
+        "number": int(number_match.group(1)) if number_match else None,
+    }
+
+
+def can_close_ticket(member: discord.Member, channel: discord.TextChannel) -> bool:
+    meta = ticket_metadata(channel)
+    return (
+        meta["owner_id"] == member.id
+        or is_staff(member)
+    )
+
+
+async def next_ticket_number(guild: discord.Guild) -> int:
+    async with ticket_counter_lock:
+        panel = find_text(guild, "open-ticket")
+        if not panel:
+            return int(discord.utils.utcnow().timestamp()) % 100000
+
+        topic = panel.topic or ""
+        match = re.search(r"ticket-counter:(\d+)", topic)
+        current = int(match.group(1)) if match else 0
+        number = current + 1
+
+        cleaned = re.sub(r"\s*\|?\s*ticket-counter:\d+", "", topic).strip(" |")
+        new_topic = f"{cleaned} | ticket-counter:{number}" if cleaned else f"ticket-counter:{number}"
+        await panel.edit(
+            topic=new_topic[:1024],
+            reason="Smash & Steal ticket counter",
+        )
+        return number
+
+
+async def build_ticket_transcript(channel: discord.TextChannel) -> bytes:
+    lines = [
+        f"Smash & Steal Ticket Transcript",
+        f"Channel: {channel.name}",
+        f"Channel ID: {channel.id}",
+        f"Topic: {channel.topic or ''}",
+        "",
+    ]
+
+    try:
+        async for message in channel.history(limit=None, oldest_first=True):
+            timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            author = f"{message.author} ({message.author.id})"
+            content = message.content.strip() if message.content else "[no text content available]"
+            lines.append(f"[{timestamp}] {author}")
+            lines.append(content)
+
+            if message.attachments:
+                for attachment in message.attachments:
+                    lines.append(f"[attachment] {attachment.url}")
+
+            if message.embeds:
+                lines.append(f"[embeds] {len(message.embeds)}")
+
+            lines.append("")
+    except discord.HTTPException as exc:
+        lines.append(f"[transcript error] HTTP {exc.status}")
+
+    return "\n".join(lines).encode("utf-8", errors="replace")
+
+
+async def log_ticket_open(channel: discord.TextChannel, opener: discord.Member):
+    log_channel = find_text(channel.guild, "ticket-logs")
+    if not log_channel:
+        return
+
+    meta = ticket_metadata(channel)
+    number = meta["number"]
+    embed = discord.Embed(
+        title=f"🎫 Ticket #{number:04d} opened" if number else "🎫 Ticket opened",
+        description=f"{opener.mention} opened {channel.mention}.",
+        colour=discord.Colour(0x57F287),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Type", value=meta["type"], inline=True)
+    embed.add_field(name="User", value=f"{opener} ({opener.id})", inline=False)
+    await log_channel.send(embed=embed)
+
+
+async def log_ticket_close(
+    channel: discord.TextChannel,
+    closer: discord.Member,
+    reason: str,
+):
+    log_channel = find_text(channel.guild, "ticket-logs")
+    if not log_channel:
+        return
+
+    meta = ticket_metadata(channel)
+    number = meta["number"]
+    transcript = await build_ticket_transcript(channel)
+    filename = f"ticket-{number:04d}.txt" if number else f"ticket-{channel.id}.txt"
+
+    embed = discord.Embed(
+        title=f"🔒 Ticket #{number:04d} closed" if number else "🔒 Ticket closed",
+        colour=discord.Colour(0xED4245),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Owner",
+        value=f"<@{meta['owner_id']}>" if meta["owner_id"] else "Unknown",
+        inline=True,
+    )
+    embed.add_field(name="Type", value=meta["type"], inline=True)
+    embed.add_field(name="Closed by", value=f"{closer} ({closer.id})", inline=False)
+    embed.add_field(name="Reason", value=reason[:1024], inline=False)
+
+    await log_channel.send(
+        embed=embed,
+        file=discord.File(io.BytesIO(transcript), filename=filename),
+    )
+
+
+class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
+    reason = discord.ui.TextInput(
+        label="Reason for closing",
+        placeholder="Resolved, duplicate, false report, etc.",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=2,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if (
+            not interaction.guild
+            or not isinstance(interaction.user, discord.Member)
+            or not isinstance(interaction.channel, discord.TextChannel)
+        ):
+            await interaction.response.send_message(
+                "This is not a valid ticket.",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.channel
+        if not can_close_ticket(interaction.user, channel):
+            await interaction.response.send_message(
+                "Only the ticket owner or staff can close this ticket.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            await log_ticket_close(
+                channel,
+                interaction.user,
+                str(self.reason.value),
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(
+            "✅ Transcript saved. Closing ticket...",
+            ephemeral=True,
+        )
+        await asyncio.sleep(1)
+
+        try:
+            await channel.delete(
+                reason=f"Ticket closed by {interaction.user}: {self.reason.value}"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I could not delete the ticket channel.",
+                ephemeral=True,
+            )
+
+
 class CloseTicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -503,24 +684,25 @@ class CloseTicketView(discord.ui.View):
         custom_id="sas:ticket:close",
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        if (
+            not interaction.guild
+            or not isinstance(interaction.user, discord.Member)
+            or not isinstance(interaction.channel, discord.TextChannel)
+        ):
+            await interaction.response.send_message(
+                "This is not a ticket channel.",
+                ephemeral=True,
+            )
             return
-        owner_match = re.search(r"ticket-owner:(\d+)", interaction.channel.topic or "")
-        is_owner = bool(owner_match and int(owner_match.group(1)) == interaction.user.id)
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if not is_owner and not (member and is_staff(member)):
+
+        if not can_close_ticket(interaction.user, interaction.channel):
             await interaction.response.send_message(
                 "Only the ticket owner or staff can close this ticket.",
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message("Closing ticket in 3 seconds...", ephemeral=True)
-        await asyncio.sleep(3)
-        try:
-            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
-        except discord.Forbidden:
-            pass
+
+        await interaction.response.send_modal(CloseTicketModal())
 
 
 class TicketButton(discord.ui.Button):
@@ -535,7 +717,10 @@ class TicketButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This button only works in the server.", ephemeral=True)
+            await interaction.response.send_message(
+                "This button only works in the server.",
+                ephemeral=True,
+            )
             return
 
         guild = interaction.guild
@@ -554,9 +739,13 @@ class TicketButton(discord.ui.Button):
         if not category:
             category = await guild.create_category(
                 "🎫 TICKETS",
-                overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)},
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False)
+                },
                 reason="Ticket system setup",
             )
+
+        number = await next_ticket_number(guild)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -565,18 +754,30 @@ class TicketButton(discord.ui.Button):
                 send_messages=True,
                 read_message_history=True,
                 attach_files=True,
+                embed_links=True,
             ),
-            guild.me: discord.PermissionOverwrite(
+        }
+
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 manage_channels=True,
                 read_message_history=True,
-            ),
-        }
+                manage_messages=True,
+                attach_files=True,
+            )
 
-        staff_names = {"Founder", "Developer", "Community Manager", "Moderator"}
+        staff_names = {
+            "Owner",
+            "Founder",
+            "Developer",
+            "Community Manager",
+            "Moderator",
+        }
         if self.ticket_type == "help":
             staff_names.add("Helper")
+
         for role_name in staff_names:
             role = find_role(guild, role_name)
             if role:
@@ -584,16 +785,21 @@ class TicketButton(discord.ui.Button):
                     view_channel=True,
                     send_messages=True,
                     read_message_history=True,
+                    attach_files=True,
                 )
 
         try:
             ticket_emoji = TICKET_EMOJIS.get(self.ticket_type, "🎫")
             channel = await guild.create_text_channel(
-                f"{ticket_emoji}・{self.ticket_type}-{safe_name(user.display_name)}",
+                f"{ticket_emoji}・{number:04d}-{self.ticket_type}-{safe_name(user.display_name)}",
                 category=category,
-                topic=f"ticket-owner:{user.id} | type:{self.ticket_type}",
+                topic=(
+                    f"ticket-owner:{user.id} | "
+                    f"type:{self.ticket_type} | "
+                    f"ticket-number:{number}"
+                ),
                 overwrites=overwrites,
-                reason=f"Ticket opened by {user}",
+                reason=f"Ticket #{number:04d} opened by {user}",
             )
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -607,10 +813,19 @@ class TicketButton(discord.ui.Button):
             "player": "Explain what happened, who was involved, and add evidence if you have it.",
             "exploit": "Describe the exploit privately. Do not post exploit steps in public channels.",
         }
+
         await channel.send(
-            f"{user.mention} **{self.ticket_type.upper()} ticket**\n{instructions[self.ticket_type]}",
+            f"{user.mention} **Ticket #{number:04d}**\n"
+            f"Type: **{self.ticket_type.upper()}**\n"
+            f"{instructions[self.ticket_type]}",
             view=CloseTicketView(),
         )
+
+        try:
+            await log_ticket_open(channel, user)
+        except discord.HTTPException:
+            pass
+
         await interaction.response.send_message(
             f"Ticket created: {channel.mention}",
             ephemeral=True,
