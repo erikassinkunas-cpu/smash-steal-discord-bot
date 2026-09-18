@@ -518,11 +518,12 @@ async def setup_server(guild: discord.Guild, progress=None):
     ]
 
     for category, name, read_only, member_only in channel_defs:
-        if not find_text(guild, name):
-            await ensure_text(guild, category, name, read_only, member_only)
-            created.append(f"channel:{name}")
+        existed = find_text(guild, name)
+        channel = await ensure_text(guild, category, name, read_only, member_only)
+        if not existed:
+            created.append(f"channel:{channel.name}")
         done["channels"] += 1
-        await tick(f"Text channel: #{name}")
+        await tick(f"Text channel: #{channel.name}")
 
     for category, name in [
         (community, "Hangout"),
@@ -679,6 +680,91 @@ async def setup_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="emojis",
+    description="Add the Smash & Steal emojis to existing channel names",
+    guild=GUILD,
+)
+async def emojis_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    renamed = []
+    already_ok = []
+    missing = []
+    failed = []
+
+    for base_name, display_name in CHANNEL_NAMES.items():
+        channel = (
+            discord.utils.get(guild.text_channels, name=display_name)
+            or discord.utils.get(guild.text_channels, name=base_name)
+        )
+        if not channel:
+            missing.append(base_name)
+            continue
+        if channel.name == display_name:
+            already_ok.append(display_name)
+            continue
+        try:
+            await channel.edit(
+                name=display_name,
+                reason="Smash & Steal emoji channel update",
+            )
+            renamed.append(display_name)
+            await asyncio.sleep(0.2)
+        except discord.Forbidden:
+            failed.append(f"{base_name} (Missing Access)")
+        except discord.HTTPException as exc:
+            failed.append(f"{base_name} ({exc.status})")
+
+    for base_name, display_name in VOICE_NAMES.items():
+        channel = (
+            discord.utils.get(guild.voice_channels, name=display_name)
+            or discord.utils.get(guild.voice_channels, name=base_name)
+        )
+        if not channel:
+            missing.append(base_name)
+            continue
+        if channel.name == display_name:
+            already_ok.append(display_name)
+            continue
+        try:
+            await channel.edit(
+                name=display_name,
+                reason="Smash & Steal emoji voice update",
+            )
+            renamed.append(display_name)
+            await asyncio.sleep(0.2)
+        except discord.Forbidden:
+            failed.append(f"{base_name} (Missing Access)")
+        except discord.HTTPException as exc:
+            failed.append(f"{base_name} ({exc.status})")
+
+    lines = [
+        "## ✅ Channel emoji update finished",
+        f"Renamed: **{len(renamed)}**",
+        f"Already correct: **{len(already_ok)}**",
+        f"Missing channels: **{len(missing)}**",
+        f"Failed: **{len(failed)}**",
+    ]
+    if failed:
+        lines.append("\n**Could not rename:**\n" + "\n".join(f"• {x}" for x in failed[:15]))
+    if missing:
+        lines.append("\n**Not found:**\n" + "\n".join(f"• {x}" for x in missing[:15]))
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(
     name="panels",
     description="Post Verify, role picker and ticket panels",
     guild=GUILD,
@@ -727,6 +813,7 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**Commands**\n"
         "`/setup` create missing server structure\n"
+        "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
         ephemeral=True,
