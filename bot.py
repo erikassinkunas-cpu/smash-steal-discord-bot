@@ -227,6 +227,36 @@ ROLE_SPECS = {
             **LIGHT_ROLE_PERMISSIONS,
         },
     },
+    "Active": {
+        "emoji": "🌱",
+        "colour": 0x57F287,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Regular": {
+        "emoji": "🔥",
+        "colour": 0xE67E22,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Veteran": {
+        "emoji": "💎",
+        "colour": 0x3498DB,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Elite": {
+        "emoji": "🏆",
+        "colour": 0xF1C40F,
+        "hoist": False,
+        "permissions": {},
+    },
+    "Legend": {
+        "emoji": "👑",
+        "colour": 0x9B59B6,
+        "hoist": False,
+        "permissions": {},
+    },
 }
 
 ROLE_ORDER = list(ROLE_SPECS.keys())
@@ -3339,7 +3369,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/serveraudit` audit roles, channels, permissions and panels\n"
         "`/cleanup` safely clean duplicate roles/channels/categories\n"
         "`/kick`, `/ban`, `/unban`, `/timeout`, `/untimeout` moderation\n"
-        "`/rank`, `/leaderboard` XP and levels\n"
+        "`/rank`, `/leaderboard`, `/rewards` XP and level rewards\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
