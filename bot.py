@@ -51,6 +51,39 @@ SELF_ROLES = [
 STAFF_ROLE_NAMES = {"Founder", "Developer", "Community Manager", "Moderator"}
 
 
+CHANNEL_NAMES = {
+    "start-here": "👋・start-here",
+    "rules": "📜・rules",
+    "verify": "✅・verify",
+    "choose-roles": "🎭・choose-roles",
+    "announcements": "📢・announcements",
+    "sneak-peeks": "👀・sneak-peeks",
+    "update-log": "📝・update-log",
+    "general": "💬・general",
+    "clips-and-loot": "💰・clips-and-loot",
+    "find-a-crew": "🤝・find-a-crew",
+    "polls-and-events": "🎉・polls-and-events",
+    "hall-of-fame": "🏆・hall-of-fame",
+    "help-and-faq": "❓・help-and-faq",
+    "open-ticket": "🎫・open-ticket",
+    "bug-reports": "🐛・bug-reports",
+    "suggestions": "💡・suggestions",
+    "test-info": "🎮・test-info",
+    "tester-chat": "🧪・tester-chat",
+    "known-issues": "🚧・known-issues",
+    "staff-chat": "🛠・staff-chat",
+    "mod-alerts": "🛡・mod-alerts",
+    "bot-logs": "🤖・bot-logs",
+}
+
+VOICE_NAMES = {
+    "Hangout": "🔊・Hangout",
+    "Crew Room": "👥・Crew Room",
+    "Playtest Room": "🧪・Playtest Room",
+    "Team Room": "🛠・Team Room",
+}
+
+
 def safe_name(value: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "-", value.lower().strip()).strip("-")
     return value[:50] or "member"
@@ -61,7 +94,11 @@ def find_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
 
 
 def find_text(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
-    return discord.utils.get(guild.text_channels, name=name)
+    display_name = CHANNEL_NAMES.get(name, name)
+    return (
+        discord.utils.get(guild.text_channels, name=display_name)
+        or discord.utils.get(guild.text_channels, name=name)
+    )
 
 
 def find_category(guild: discord.Guild, name: str) -> Optional[discord.CategoryChannel]:
@@ -327,8 +364,14 @@ async def ensure_category(guild: discord.Guild, name: str, overwrites=None):
 
 
 async def ensure_text(guild, category, name, read_only=False, member_only=False):
+    display_name = CHANNEL_NAMES.get(name, name)
     existing = find_text(guild, name)
     if existing:
+        if existing.name != display_name:
+            try:
+                await existing.edit(name=display_name, reason="Smash & Steal channel emoji update")
+            except discord.Forbidden:
+                pass
         return existing
 
     overwrites = {}
@@ -351,7 +394,7 @@ async def ensure_text(guild, category, name, read_only=False, member_only=False)
             )
 
     return await guild.create_text_channel(
-        name,
+        display_name,
         category=category,
         overwrites=overwrites,
         reason="Smash & Steal setup",
@@ -359,10 +402,19 @@ async def ensure_text(guild, category, name, read_only=False, member_only=False)
 
 
 async def ensure_voice(guild, category, name):
-    existing = discord.utils.get(guild.voice_channels, name=name)
+    display_name = VOICE_NAMES.get(name, name)
+    existing = (
+        discord.utils.get(guild.voice_channels, name=display_name)
+        or discord.utils.get(guild.voice_channels, name=name)
+    )
     if existing:
+        if existing.name != display_name:
+            try:
+                await existing.edit(name=display_name, reason="Smash & Steal voice emoji update")
+            except discord.Forbidden:
+                pass
         return existing
-    return await guild.create_voice_channel(name, category=category, reason="Smash & Steal setup")
+    return await guild.create_voice_channel(display_name, category=category, reason="Smash & Steal setup")
 
 
 def staff_overwrites(guild):
@@ -478,9 +530,15 @@ async def setup_server(guild: discord.Guild, progress=None):
         (playtest, "Playtest Room"),
         (team, "Team Room"),
     ]:
-        if not discord.utils.get(guild.voice_channels, name=name):
+        display_name = VOICE_NAMES.get(name, name)
+        if not (
+            discord.utils.get(guild.voice_channels, name=display_name)
+            or discord.utils.get(guild.voice_channels, name=name)
+        ):
             await ensure_voice(guild, category, name)
-            created.append(f"voice:{name}")
+            created.append(f"voice:{display_name}")
+        else:
+            await ensure_voice(guild, category, name)
         done["channels"] += 1
         await tick(f"Voice channel: {name}")
 
@@ -497,7 +555,10 @@ async def setup_server(guild: discord.Guild, progress=None):
     done["permissions"] += 1
     await tick("Permissions: tester-chat")
 
-    playtest_room = discord.utils.get(guild.voice_channels, name="Playtest Room")
+    playtest_room = (
+        discord.utils.get(guild.voice_channels, name=VOICE_NAMES["Playtest Room"])
+        or discord.utils.get(guild.voice_channels, name="Playtest Room")
+    )
     if tester and playtest_room:
         await playtest_room.set_permissions(guild.default_role, view_channel=False)
         await playtest_room.set_permissions(
