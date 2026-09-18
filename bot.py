@@ -19,6 +19,12 @@ intents.guilds = True
 
 
 ROLE_SPECS = {
+    "Owner": {
+        "emoji": "🔱",
+        "colour": 0xE74C3C,
+        "hoist": True,
+        "permissions": {"administrator": True},
+    },
     "Founder": {
         "emoji": "👑",
         "colour": 0xF1C40F,
@@ -31,9 +37,12 @@ ROLE_SPECS = {
         "hoist": True,
         "permissions": {
             "view_audit_log": True,
+            "manage_roles": True,
             "manage_channels": True,
             "manage_webhooks": True,
+            "manage_messages": True,
             "manage_threads": True,
+            "manage_events": True,
         },
     },
     "Community Manager": {
@@ -42,11 +51,13 @@ ROLE_SPECS = {
         "hoist": True,
         "permissions": {
             "view_audit_log": True,
+            "manage_roles": True,
             "manage_channels": True,
             "manage_messages": True,
             "manage_threads": True,
             "manage_nicknames": True,
             "moderate_members": True,
+            "kick_members": True,
             "manage_events": True,
         },
     },
@@ -107,7 +118,23 @@ ROLE_SPECS = {
         "emoji": "✅",
         "colour": 0x95A5A6,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            "view_channel": True,
+            "send_messages": True,
+            "read_message_history": True,
+            "add_reactions": True,
+            "embed_links": True,
+            "attach_files": True,
+            "use_external_emojis": True,
+            "use_external_stickers": True,
+            "connect": True,
+            "speak": True,
+            "stream": True,
+            "use_voice_activation": True,
+            "use_application_commands": True,
+            "create_public_threads": True,
+            "send_messages_in_threads": True,
+        },
     },
     "Update Ping": {
         "emoji": "📢",
@@ -153,6 +180,8 @@ ROLE_SPECS = {
     },
 }
 
+ROLE_ORDER = list(ROLE_SPECS.keys())
+
 ROLE_DEFS = {name: spec["hoist"] for name, spec in ROLE_SPECS.items()}
 
 
@@ -166,7 +195,7 @@ SELF_ROLES = [
     ("Console", "🎮"),
 ]
 
-STAFF_ROLE_NAMES = {"Founder", "Developer", "Community Manager", "Moderator"}
+STAFF_ROLE_NAMES = {"Owner", "Founder", "Developer", "Community Manager", "Moderator"}
 
 
 CHANNEL_NAMES = {
@@ -228,16 +257,43 @@ def role_display_name(name: str) -> str:
     spec = ROLE_SPECS.get(name)
     if not spec:
         return name
-    return f"{spec['emoji']} {name}"
+    return f"{spec['emoji']}・{name}"
+
+
+def normalise_role_name(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^[^A-Za-z0-9]+", "", value)
+    value = value.replace("・", " ").replace("|", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value.casefold()
 
 
 def find_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
     display_name = role_display_name(name)
-    return (
+    exact = (
         discord.utils.get(guild.roles, name=display_name)
         or discord.utils.get(guild.roles, name=name)
     )
+    if exact:
+        return exact
 
+    target = normalise_role_name(name)
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        if normalise_role_name(role.name) == target:
+            return role
+    return None
+
+
+def bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    me = guild.me
+    return bool(
+        me
+        and not role.managed
+        and role < me.top_role
+        and me.guild_permissions.manage_roles
+    )
 
 def find_text(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
     display_name = CHANNEL_NAMES.get(name, name)
@@ -523,6 +579,36 @@ def build_permissions(spec):
     return permissions
 
 
+def role_audit(guild: discord.Guild, name: str):
+    spec = ROLE_SPECS[name]
+    role = find_role(guild, name)
+    issues = []
+
+    if not role:
+        return None, ["missing"]
+
+    expected_name = role_display_name(name)
+    expected_permissions = build_permissions(spec)
+
+    if role.name != expected_name:
+        issues.append("name/emoji")
+    if role.colour.value != spec["colour"]:
+        issues.append("colour")
+    if role.hoist != spec["hoist"]:
+        issues.append("hoist")
+    if role.permissions.value != expected_permissions.value:
+        issues.append("permissions")
+    if role.managed:
+        issues.append("managed")
+    if guild.me and role >= guild.me.top_role:
+        issues.append("above bot")
+
+    if "ROLE_ICONS" in guild.features and role.unicode_emoji != spec["emoji"]:
+        issues.append("role icon")
+
+    return role, issues
+
+
 async def ensure_role(guild: discord.Guild, name: str, hoist: bool = False):
     spec = ROLE_SPECS.get(name, {
         "emoji": "",
@@ -530,12 +616,13 @@ async def ensure_role(guild: discord.Guild, name: str, hoist: bool = False):
         "hoist": hoist,
         "permissions": {},
     })
+
     display_name = role_display_name(name)
     permissions = build_permissions(spec)
     colour = discord.Colour(spec.get("colour", 0))
     role_icon_supported = "ROLE_ICONS" in guild.features
-
     existing = find_role(guild, name)
+
     kwargs = {
         "name": display_name,
         "permissions": permissions,
@@ -544,14 +631,49 @@ async def ensure_role(guild: discord.Guild, name: str, hoist: bool = False):
         "mentionable": False,
         "reason": "Smash & Steal role setup",
     }
+
     if role_icon_supported and spec.get("emoji"):
         kwargs["display_icon"] = spec["emoji"]
 
     if existing:
+        if existing.managed:
+            raise RuntimeError(f"{existing.name} is a managed Discord role")
+        if not bot_can_manage_role(guild, existing):
+            raise PermissionError(
+                f"{existing.name} is above the bot role or Manage Roles is missing"
+            )
         return await existing.edit(**kwargs)
 
+    me = guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        raise PermissionError("Bot is missing Manage Roles")
     return await guild.create_role(**kwargs)
 
+
+async def reorder_managed_roles(guild: discord.Guild):
+    me = guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        return [], ["Bot is missing Manage Roles"]
+
+    moved = []
+    failed = []
+    for name in reversed(ROLE_ORDER):
+        role = find_role(guild, name)
+        if not role or role.managed:
+            continue
+        if role >= me.top_role:
+            failed.append(f"{role.name}: above bot")
+            continue
+        try:
+            await role.move(
+                below=me.top_role,
+                reason="Smash & Steal role hierarchy",
+            )
+            moved.append(role.name)
+            await asyncio.sleep(0.2)
+        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            failed.append(f"{role.name}: {type(exc).__name__}")
+    return moved, failed
 
 async def ensure_category(guild: discord.Guild, name: str, overwrites=None):
     existing = find_category(guild, name)
@@ -657,11 +779,15 @@ async def setup_server(guild: discord.Guild, progress=None):
 
     for name, hoist in ROLE_DEFS.items():
         existed = find_role(guild, name)
-        role = await ensure_role(guild, name, hoist)
-        if not existed:
-            created.append(f"role:{role.name}")
+        try:
+            role = await ensure_role(guild, name, hoist)
+            if not existed:
+                created.append(f"role:{role.name}")
+            current_role = role.name
+        except (discord.Forbidden, discord.HTTPException, PermissionError, RuntimeError) as exc:
+            current_role = f"{name} skipped: {type(exc).__name__}"
         done["roles"] += 1
-        await tick(f"Role: {role.name}")
+        await tick(f"Role: {current_role}")
 
     category_specs = [
         ("start", "🚪 START HERE", None),
@@ -1022,7 +1148,7 @@ async def emojis_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="rolesetup",
-    description="Apply Smash & Steal role names, colours and permissions",
+    description="Force-fix role names, colours, permissions and hierarchy",
     guild=GUILD,
 )
 async def rolesetup_cmd(interaction: discord.Interaction):
@@ -1039,52 +1165,144 @@ async def rolesetup_cmd(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild = interaction.guild
-    updated = []
-    failed = []
-    skipped = []
+    me = guild.me
 
-    for name, spec in ROLE_SPECS.items():
-        role = find_role(guild, name)
-        if role and role.managed:
-            skipped.append(f"{name} (managed role)")
+    if not me or not me.guild_permissions.manage_roles:
+        await interaction.followup.send(
+            "❌ The bot does not have **Manage Roles**.",
+            ephemeral=True,
+        )
+        return
+
+    updated = []
+    blocked = []
+    created = []
+
+    for index, (name, spec) in enumerate(ROLE_SPECS.items(), start=1):
+        existing = find_role(guild, name)
+
+        if existing and existing.managed:
+            blocked.append(f"{existing.name}: managed by Discord")
             continue
 
-        if role and guild.me and role >= guild.me.top_role:
-            failed.append(f"{name} (role is above or equal to the bot role)")
+        if existing and existing >= me.top_role:
+            blocked.append(
+                f"{existing.name}: move this role BELOW **{me.top_role.name}**"
+            )
             continue
 
         try:
             result = await ensure_role(guild, name, spec["hoist"])
-            updated.append(result.name)
+            if existing:
+                updated.append(result.name)
+            else:
+                created.append(result.name)
             await asyncio.sleep(0.25)
+        except PermissionError as exc:
+            blocked.append(f"{name}: {exc}")
+        except RuntimeError as exc:
+            blocked.append(f"{name}: {exc}")
         except discord.Forbidden:
-            failed.append(f"{name} (Missing Access / Manage Roles)")
+            blocked.append(f"{name}: Missing Access")
         except discord.HTTPException as exc:
-            failed.append(f"{name} (HTTP {exc.status})")
+            blocked.append(f"{name}: HTTP {exc.status}")
 
-    role_icons = "ROLE_ICONS" in guild.features
+        if index % 5 == 0:
+            await interaction.edit_original_response(
+                content=(
+                    "## 🎭 Role setup in progress\n"
+                    f"Processed: **{index}/{len(ROLE_SPECS)}**\n"
+                    f"Updated: **{len(updated)}**\n"
+                    f"Created: **{len(created)}**\n"
+                    f"Blocked: **{len(blocked)}**"
+                )
+            )
+
+    moved, move_failed = await reorder_managed_roles(guild)
+    blocked.extend(move_failed)
+
+    compliant = []
+    audit_issues = []
+    for name in ROLE_SPECS:
+        role, issues = role_audit(guild, name)
+        if not issues:
+            compliant.append(role.name)
+        else:
+            audit_issues.append(
+                f"{role_display_name(name)}: {', '.join(issues)}"
+            )
+
     lines = [
-        "## ✅ Role setup finished",
-        f"Updated or created: **{len(updated)}**",
-        f"Skipped: **{len(skipped)}**",
-        f"Failed: **{len(failed)}**",
+        "## ✅ Smash & Steal role setup finished",
+        f"Updated: **{len(updated)}**",
+        f"Created: **{len(created)}**",
+        f"Hierarchy moves: **{len(moved)}**",
+        f"Fully correct now: **{len(compliant)}/{len(ROLE_SPECS)}**",
+        f"Blocked / still wrong: **{len(audit_issues)}**",
         "",
-        f"Actual Discord role icons available: **{'Yes' if role_icons else 'No'}**",
-        "Every managed role still gets an emoji in its role name.",
+        f"Bot top role: **{me.top_role.name}**",
+        "Emoji is always placed in the role name. A real separate role icon is added only when Discord enables ROLE_ICONS for the server.",
     ]
 
-    if failed:
+    if audit_issues:
         lines.append(
-            "\n**Could not update:**\n"
-            + "\n".join(f"• {item}" for item in failed[:20])
-        )
-    if skipped:
-        lines.append(
-            "\n**Skipped:**\n"
-            + "\n".join(f"• {item}" for item in skipped[:20])
+            "\n**Still needs attention:**\n"
+            + "\n".join(f"• {item}" for item in audit_issues[:25])
         )
 
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
+    if blocked:
+        unique_blocked = list(dict.fromkeys(blocked))
+        lines.append(
+            "\n**Why some changes were blocked:**\n"
+            + "\n".join(f"• {item}" for item in unique_blocked[:25])
+        )
+
+    await interaction.edit_original_response(content="\n".join(lines))
+
+
+@bot.tree.command(
+    name="roleaudit",
+    description="Check every Smash & Steal role against its expected setup",
+    guild=GUILD,
+)
+async def roleaudit_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    good = []
+    bad = []
+
+    for name in ROLE_SPECS:
+        role, issues = role_audit(guild, name)
+        if not issues:
+            good.append(role.name)
+        else:
+            bad.append(f"{role_display_name(name)}: {', '.join(issues)}")
+
+    lines = [
+        "## 🔎 Role audit",
+        f"Correct: **{len(good)}/{len(ROLE_SPECS)}**",
+        f"Needs fixing: **{len(bad)}**",
+    ]
+
+    if bad:
+        lines.append(
+            "\n**Problems:**\n"
+            + "\n".join(f"• {item}" for item in bad[:30])
+        )
+    else:
+        lines.append("\n✅ Every managed role matches the specification.")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(
@@ -1136,7 +1354,8 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**Commands**\n"
         "`/setup` create missing server structure\n"
-        "`/rolesetup` apply role colours, emojis and permissions\n"
+        "`/rolesetup` force-fix role colours, emojis, permissions and order\n"
+        "`/roleaudit` check every managed role\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
