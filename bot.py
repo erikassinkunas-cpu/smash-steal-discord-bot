@@ -306,6 +306,7 @@ class SmashStealBot(discord.Client):
 
 bot = SmashStealBot()
 GUILD = discord.Object(id=GUILD_ID)
+setup_lock = asyncio.Lock()
 
 
 async def ensure_role(guild: discord.Guild, name: str, hoist: bool = False):
@@ -383,20 +384,58 @@ def staff_overwrites(guild):
     return overwrites
 
 
-async def setup_server(guild: discord.Guild):
+async def setup_server(guild: discord.Guild, progress=None):
     created = []
+    totals = {
+        "roles": len(ROLE_DEFS),
+        "categories": 7,
+        "channels": 26,
+        "permissions": 2,
+    }
+    done = {key: 0 for key in totals}
+
+    async def tick(current: str, force: bool = False):
+        if progress:
+            await progress(done.copy(), totals, current, force)
+
+    await tick("Starting setup...", True)
 
     for name, hoist in ROLE_DEFS.items():
         if not find_role(guild, name):
             await ensure_role(guild, name, hoist)
             created.append(f"role:{name}")
+        done["roles"] += 1
+        await tick(f"Role: {name}")
 
-    start = await ensure_category(guild, "🚪 START HERE")
-    updates = await ensure_category(guild, "📢 GAME UPDATES")
-    community = await ensure_category(guild, "🏙️ COMMUNITY")
-    support = await ensure_category(guild, "🛟 SUPPORT")
-    playtest = await ensure_category(guild, "🧪 PLAYTEST")
-    team = await ensure_category(guild, "🔒 TEAM", overwrites=staff_overwrites(guild))
+    category_specs = [
+        ("start", "🚪 START HERE", None),
+        ("updates", "📢 GAME UPDATES", None),
+        ("community", "🏙️ COMMUNITY", None),
+        ("support", "🛟 SUPPORT", None),
+        ("playtest", "🧪 PLAYTEST", None),
+        ("team", "🔒 TEAM", staff_overwrites(guild)),
+        (
+            "tickets",
+            "🎫 TICKETS",
+            {guild.default_role: discord.PermissionOverwrite(view_channel=False)},
+        ),
+    ]
+
+    categories = {}
+    for key, name, overwrites in category_specs:
+        existed = find_category(guild, name)
+        categories[key] = await ensure_category(guild, name, overwrites=overwrites)
+        if not existed:
+            created.append(f"category:{name}")
+        done["categories"] += 1
+        await tick(f"Category: {name}")
+
+    start = categories["start"]
+    updates = categories["updates"]
+    community = categories["community"]
+    support = categories["support"]
+    playtest = categories["playtest"]
+    team = categories["team"]
 
     channel_defs = [
         (start, "start-here", True, False),
@@ -427,6 +466,8 @@ async def setup_server(guild: discord.Guild):
         if not find_text(guild, name):
             await ensure_text(guild, category, name, read_only, member_only)
             created.append(f"channel:{name}")
+        done["channels"] += 1
+        await tick(f"Text channel: #{name}")
 
     for category, name in [
         (community, "Hangout"),
@@ -437,14 +478,8 @@ async def setup_server(guild: discord.Guild):
         if not discord.utils.get(guild.voice_channels, name=name):
             await ensure_voice(guild, category, name)
             created.append(f"voice:{name}")
-
-    if not find_category(guild, "🎫 TICKETS"):
-        await guild.create_category(
-            "🎫 TICKETS",
-            overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)},
-            reason="Ticket system setup",
-        )
-        created.append("category:TICKETS")
+        done["channels"] += 1
+        await tick(f"Voice channel: {name}")
 
     tester = find_role(guild, "Tester")
     tester_chat = find_text(guild, "tester-chat")
@@ -456,6 +491,8 @@ async def setup_server(guild: discord.Guild):
             send_messages=True,
             read_message_history=True,
         )
+    done["permissions"] += 1
+    await tick("Permissions: tester-chat")
 
     playtest_room = discord.utils.get(guild.voice_channels, name="Playtest Room")
     if tester and playtest_room:
@@ -466,6 +503,8 @@ async def setup_server(guild: discord.Guild):
             connect=True,
             speak=True,
         )
+    done["permissions"] += 1
+    await tick("Permissions: Playtest Room", True)
 
     return created
 
@@ -508,23 +547,71 @@ async def setup_cmd(interaction: discord.Interaction):
         )
         return
 
+    if setup_lock.locked():
+        await interaction.response.send_message(
+            "⚙️ Setup is already running. Wait for the current setup to finish.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        created = await setup_server(interaction.guild)
-        summary = (
-            "Nothing new was needed."
-            if not created
-            else f"Created {len(created)} missing server items."
+    last_update = 0.0
+
+    def render_progress(done, totals, current):
+        completed = sum(done.values())
+        total = sum(totals.values())
+        percent = int((completed / total) * 100) if total else 100
+        width = 14
+        filled = round(width * completed / total) if total else width
+        bar = "█" * filled + "░" * (width - filled)
+        return (
+            "## ⚙️ Smash & Steal Setup\n"
+            f"`{bar}` **{percent}%**\n\n"
+            f"🎭 Roles: **{done['roles']}/{totals['roles']}**\n"
+            f"📁 Categories: **{done['categories']}/{totals['categories']}**\n"
+            f"💬 Channels: **{done['channels']}/{totals['channels']}**\n"
+            f"🔐 Permissions: **{done['permissions']}/{totals['permissions']}**\n\n"
+            f"Current: `{current}`\n"
+            "Do not run /setup again while this is running."
         )
-        await interaction.followup.send(
-            f"✅ Setup complete. {summary}\nNext run `/panels`.",
-            ephemeral=True,
-        )
-    except discord.Forbidden as exc:
-        await interaction.followup.send(
-            f"❌ Missing Discord permissions: {exc}",
-            ephemeral=True,
-        )
+
+    async def progress(done, totals, current, force=False):
+        nonlocal last_update
+        now = asyncio.get_running_loop().time()
+        if not force and now - last_update < 1.5:
+            return
+        last_update = now
+        try:
+            await interaction.edit_original_response(
+                content=render_progress(done, totals, current)
+            )
+        except discord.HTTPException:
+            pass
+
+    async with setup_lock:
+        try:
+            created = await setup_server(interaction.guild, progress=progress)
+            summary = (
+                "Nothing new was needed."
+                if not created
+                else f"Created **{len(created)}** missing server items."
+            )
+            await interaction.edit_original_response(
+                content=(
+                    "## ✅ Setup complete\n"
+                    f"{summary}\n\n"
+                    "Next command: `/panels`"
+                )
+            )
+        except discord.Forbidden as exc:
+            await interaction.edit_original_response(
+                content=f"❌ Missing Discord permissions: `{exc}`"
+            )
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"❌ Setup stopped because of an error: `{type(exc).__name__}: {exc}`"
+            )
+            raise
 
 
 @bot.tree.command(
