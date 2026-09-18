@@ -240,6 +240,27 @@ SELF_ROLES = [
 ]
 
 STAFF_ROLE_NAMES = {"Owner", "Founder", "Developer", "Community Manager", "Moderator"}
+BROADCAST_WRITER_ROLE_NAMES = {
+    "Owner",
+    "Founder",
+    "Developer",
+    "Community Manager",
+    "Moderator",
+}
+
+READ_ONLY_CHANNELS = {
+    "choose-roles",
+    "announcements",
+    "sneak-peeks",
+    "update-log",
+    "hall-of-fame",
+    "help-and-faq",
+    "open-ticket",
+    "test-info",
+    "known-issues",
+    "welcome",
+    "goodbye",
+}
 
 
 CHANNEL_NAMES = {
@@ -965,6 +986,14 @@ def staff_roles(guild: discord.Guild):
     return [role for name in STAFF_ROLE_NAMES if (role := find_role(guild, name))]
 
 
+def broadcast_writer_roles(guild: discord.Guild):
+    return [
+        role
+        for name in BROADCAST_WRITER_ROLE_NAMES
+        if (role := find_role(guild, name))
+    ]
+
+
 def bot_permission_overwrite(channel):
     if isinstance(channel, discord.VoiceChannel):
         return discord.PermissionOverwrite(
@@ -998,6 +1027,9 @@ async def set_hidden_until_member(channel, read_only=False):
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False)
     }
+
+    writers = set(broadcast_writer_roles(guild))
+
     for role in access_roles(guild):
         if isinstance(channel, discord.VoiceChannel):
             overwrites[role] = discord.PermissionOverwrite(
@@ -1005,12 +1037,31 @@ async def set_hidden_until_member(channel, read_only=False):
                 connect=True,
                 speak=True,
             )
+            continue
+
+        if read_only:
+            can_write = role in writers
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=can_write,
+                add_reactions=True,
+                create_public_threads=can_write,
+                create_private_threads=can_write,
+                send_messages_in_threads=can_write,
+                manage_messages=True if can_write else False,
+                manage_threads=True if can_write else False,
+            )
         else:
             overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
-                send_messages=False if read_only else True,
+                send_messages=True,
+                add_reactions=True,
+                create_public_threads=True,
+                send_messages_in_threads=True,
             )
+
     await replace_channel_overwrites(channel, overwrites)
 
 
@@ -1093,25 +1144,28 @@ async def apply_verification_gate(guild: discord.Guild):
                 read_message_history=True,
                 send_messages=False,
                 add_reactions=(channel == verify),
+                create_public_threads=False,
+                create_private_threads=False,
+                send_messages_in_threads=False,
             )
         }
         for role in access_roles(guild):
+            can_write = role in set(broadcast_writer_roles(guild))
             overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
-                send_messages=False,
+                send_messages=can_write if channel == start_here else False,
                 add_reactions=(channel == verify),
+                create_public_threads=False,
+                create_private_threads=False,
+                send_messages_in_threads=False,
             )
         await replace_channel_overwrites(channel, overwrites)
 
     if choose_roles:
         await set_hidden_until_member(choose_roles, read_only=True)
 
-    read_only = [
-        "announcements", "sneak-peeks", "update-log", "hall-of-fame",
-        "help-and-faq", "open-ticket", "test-info", "known-issues",
-        "welcome", "goodbye",
-    ]
+    read_only = sorted(READ_ONLY_CHANNELS - {"choose-roles"})
     writable = [
         "general", "clips-and-loot", "find-a-crew", "polls-and-events",
         "bug-reports", "suggestions",
@@ -1541,6 +1595,39 @@ async def entrysetup_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="channelpermissions",
+    description="Fix read-only and writable channel permissions",
+    guild=GUILD,
+)
+async def channelpermissions_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await apply_verification_gate(interaction.guild)
+        await interaction.edit_original_response(
+            content=(
+                "## ✅ Channel permissions fixed\n"
+                "Read-only channels now block normal roles from sending messages and creating threads.\n"
+                "Only Owner, Founder, Developer, Community Manager and Moderator can post there."
+            )
+        )
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"❌ Channel permission update failed: {type(exc).__name__}: {exc}"
+        )
+
+
+@bot.tree.command(
     name="emojis",
     description="Fix emojis across Smash & Steal categories and channels",
     guild=GUILD,
@@ -1891,6 +1978,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/rolesetup` force-fix role colours, emojis, permissions and order\n"
         "`/roleaudit` check every managed role\n"
         "`/entrysetup` fix verification gate and entry channels\n"
+        "`/channelpermissions` enforce read-only channel permissions\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
