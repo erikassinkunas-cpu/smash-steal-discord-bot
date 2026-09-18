@@ -18,6 +18,32 @@ intents = discord.Intents.default()
 intents.guilds = True
 
 
+BASE_MEMBER_PERMISSIONS = {
+    "view_channel": True,
+    "send_messages": True,
+    "read_message_history": True,
+    "add_reactions": True,
+    "embed_links": True,
+    "attach_files": True,
+    "use_external_emojis": True,
+    "use_external_stickers": True,
+    "connect": True,
+    "speak": True,
+    "stream": True,
+    "use_voice_activation": True,
+    "use_application_commands": True,
+    "create_public_threads": True,
+    "send_messages_in_threads": True,
+    "change_nickname": True,
+}
+
+LIGHT_ROLE_PERMISSIONS = {
+    "view_channel": True,
+    "read_message_history": True,
+    "add_reactions": True,
+    "use_application_commands": True,
+}
+
 ROLE_SPECS = {
     "Owner": {
         "emoji": "🔱",
@@ -36,6 +62,7 @@ ROLE_SPECS = {
         "colour": 0x3498DB,
         "hoist": True,
         "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
             "view_audit_log": True,
             "manage_roles": True,
             "manage_channels": True,
@@ -50,6 +77,7 @@ ROLE_SPECS = {
         "colour": 0x9B59B6,
         "hoist": True,
         "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
             "view_audit_log": True,
             "manage_roles": True,
             "manage_channels": True,
@@ -66,6 +94,7 @@ ROLE_SPECS = {
         "colour": 0xE74C3C,
         "hoist": True,
         "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
             "view_audit_log": True,
             "kick_members": True,
             "ban_members": True,
@@ -80,6 +109,7 @@ ROLE_SPECS = {
         "colour": 0x2ECC71,
         "hoist": True,
         "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
             "manage_messages": True,
             "manage_threads": True,
         },
@@ -88,95 +118,106 @@ ROLE_SPECS = {
         "emoji": "🧪",
         "colour": 0x1ABC9C,
         "hoist": True,
-        "permissions": {},
+        "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
+        },
     },
     "Early Crew": {
         "emoji": "💎",
         "colour": 0xE67E22,
         "hoist": True,
-        "permissions": {},
+        "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
+        },
     },
     "Bug Hunter": {
         "emoji": "🐛",
         "colour": 0x7CB342,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
+            "create_private_threads": True,
+        },
     },
     "Content Creator": {
         "emoji": "🎬",
         "colour": 0xE91E63,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
+        },
     },
     "Contributor": {
         "emoji": "💡",
         "colour": 0x00BCD4,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **BASE_MEMBER_PERMISSIONS,
+        },
     },
     "Member": {
         "emoji": "✅",
         "colour": 0x95A5A6,
         "hoist": False,
         "permissions": {
-            "view_channel": True,
-            "send_messages": True,
-            "read_message_history": True,
-            "add_reactions": True,
-            "embed_links": True,
-            "attach_files": True,
-            "use_external_emojis": True,
-            "use_external_stickers": True,
-            "connect": True,
-            "speak": True,
-            "stream": True,
-            "use_voice_activation": True,
-            "use_application_commands": True,
-            "create_public_threads": True,
-            "send_messages_in_threads": True,
+            **BASE_MEMBER_PERMISSIONS,
         },
     },
     "Update Ping": {
         "emoji": "📢",
         "colour": 0x5865F2,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "Playtest Ping": {
         "emoji": "🧪",
         "colour": 0x57F287,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "Event Ping": {
         "emoji": "🎉",
         "colour": 0xFEE75C,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "Sneak Peek Ping": {
         "emoji": "👀",
         "colour": 0xEB459E,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "PC": {
         "emoji": "🖥️",
         "colour": 0x607D8B,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "Mobile": {
         "emoji": "📱",
         "colour": 0x4CAF50,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
     "Console": {
         "emoji": "🎮",
         "colour": 0x673AB7,
         "hoist": False,
-        "permissions": {},
+        "permissions": {
+            **LIGHT_ROLE_PERMISSIONS,
+        },
     },
 }
 
@@ -1363,9 +1404,49 @@ async def help_cmd(interaction: discord.Interaction):
     )
 
 
+async def auto_sync_roles_on_startup():
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        print("ROLE AUTO-SYNC | guild not found", flush=True)
+        return
+
+    me = guild.me
+    if not me:
+        print("ROLE AUTO-SYNC | bot member missing", flush=True)
+        return
+
+    print(
+        f"ROLE AUTO-SYNC | bot_top={me.top_role.name} | manage_roles={me.guild_permissions.manage_roles}",
+        flush=True,
+    )
+
+    ok = 0
+    blocked = []
+    for name, spec in ROLE_SPECS.items():
+        role = find_role(guild, name)
+        if role and role.managed:
+            blocked.append(f"{name}: managed")
+            continue
+        if role and role >= me.top_role:
+            blocked.append(f"{name}: above bot")
+            continue
+        try:
+            await ensure_role(guild, name, spec["hoist"])
+            ok += 1
+            await asyncio.sleep(0.15)
+        except Exception as exc:
+            blocked.append(f"{name}: {type(exc).__name__}")
+
+    print(
+        f"ROLE AUTO-SYNC DONE | ok={ok}/{len(ROLE_SPECS)} | blocked={blocked}",
+        flush=True,
+    )
+
+
 @bot.event
 async def on_ready():
     print(f"BOT READY | {bot.user} | guild={GUILD_ID}", flush=True)
+    await auto_sync_roles_on_startup()
 
 
 bot.run(TOKEN, log_handler=None)
