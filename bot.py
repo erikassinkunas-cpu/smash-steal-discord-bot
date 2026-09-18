@@ -16,12 +16,14 @@ if not GUILD_ID_RAW or not GUILD_ID_RAW.isdigit():
     raise RuntimeError("GUILD_ID is missing or invalid")
 GUILD_ID = int(GUILD_ID_RAW)
 ENABLE_MEMBER_EVENTS = os.environ.get("ENABLE_MEMBER_EVENTS", "0") == "1"
+ENABLE_MESSAGE_CONTENT = os.environ.get("ENABLE_MESSAGE_CONTENT", "0") == "1"
 RUN_CLEANUP_ON_START = os.environ.get("RUN_CLEANUP_ON_START", "0") == "1"
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.reactions = True
 intents.members = ENABLE_MEMBER_EVENTS
+intents.message_content = ENABLE_MESSAGE_CONTENT
 
 
 BASE_MEMBER_PERMISSIONS = {
@@ -1687,7 +1689,12 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    if not ENABLE_MEMBER_EVENTS or member.guild.id != GUILD_ID or member.bot:
+    if member.guild.id != GUILD_ID or member.bot:
+        return
+
+    was_kicked = await detect_and_log_kick(member)
+
+    if not ENABLE_MEMBER_EVENTS:
         return
 
     channel = find_text(member.guild, "goodbye")
@@ -1696,13 +1703,478 @@ async def on_member_remove(member: discord.Member):
 
     embed = discord.Embed(
         title="👋 Goodbye",
-        description=f"**{member.display_name}** left the server.",
+        description=(
+            f"**{member.display_name}** was removed from the server."
+            if was_kicked
+            else f"**{member.display_name}** left the server."
+        ),
         colour=discord.Colour(0xED4245),
     )
     try:
         await channel.send(embed=embed)
     except discord.HTTPException:
         pass
+
+
+def is_mod_log_channel(channel) -> bool:
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    return channel.name in {
+        CHANNEL_NAMES.get("mod-logs"),
+        CHANNEL_NAMES.get("ticket-logs"),
+        CHANNEL_NAMES.get("bot-logs"),
+    }
+
+
+async def send_mod_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    colour: int = 0x5865F2,
+    fields=None,
+):
+    channel = find_text(guild, "mod-logs")
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=description[:4096],
+        colour=discord.Colour(colour),
+        timestamp=discord.utils.utcnow(),
+    )
+    for name, value, inline in fields or []:
+        embed.add_field(
+            name=name[:256],
+            value=str(value)[:1024] or "None",
+            inline=inline,
+        )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+async def recent_audit_entry(
+    guild: discord.Guild,
+    action: discord.AuditLogAction,
+    target_id: int,
+    *,
+    max_age_seconds: int = 10,
+):
+    me = guild.me
+    if not me or not me.guild_permissions.view_audit_log:
+        return None
+
+    now = discord.utils.utcnow()
+    try:
+        async for entry in guild.audit_logs(limit=6, action=action):
+            target = getattr(entry, "target", None)
+            if getattr(target, "id", None) != target_id:
+                continue
+            age = (now - entry.created_at).total_seconds()
+            if age <= max_age_seconds:
+                return entry
+    except discord.HTTPException:
+        return None
+    return None
+
+
+def actor_can_target(actor: discord.Member, target: discord.Member):
+    guild = actor.guild
+    me = guild.me
+
+    if actor.id == target.id:
+        return False, "You cannot moderate yourself."
+    if target.id == guild.owner_id:
+        return False, "The server owner cannot be moderated."
+    if me and target.top_role >= me.top_role:
+        return False, "That member is above or equal to the bot role."
+    if actor.id != guild.owner_id and target.top_role >= actor.top_role:
+        return False, "That member is above or equal to your highest role."
+    return True, None
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if (
+        not message.guild
+        or message.guild.id != GUILD_ID
+        or is_mod_log_channel(message.channel)
+    ):
+        return
+
+    text = message.content.strip() if message.content else "[content unavailable]"
+    attachments = "\n".join(a.url for a in message.attachments) or "None"
+
+    await send_mod_log(
+        message.guild,
+        "🗑️ Message deleted",
+        f"Message by {message.author.mention} was deleted in {message.channel.mention}.",
+        colour=0xED4245,
+        fields=[
+            ("Author", f"{message.author} ({message.author.id})", False),
+            ("Content", text, False),
+            ("Attachments", attachments, False),
+            ("Message ID", message.id, True),
+        ],
+    )
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if (
+        not after.guild
+        or after.guild.id != GUILD_ID
+        or is_mod_log_channel(after.channel)
+        or before.author.bot
+    ):
+        return
+
+    if before.content == after.content:
+        return
+
+    old_text = before.content.strip() if before.content else "[content unavailable]"
+    new_text = after.content.strip() if after.content else "[content unavailable]"
+
+    await send_mod_log(
+        after.guild,
+        "✏️ Message edited",
+        f"{after.author.mention} edited a message in {after.channel.mention}.",
+        colour=0xFEE75C,
+        fields=[
+            ("Before", old_text, False),
+            ("After", new_text, False),
+            ("Message", after.jump_url, False),
+        ],
+    )
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if after.guild.id != GUILD_ID:
+        return
+
+    before_ids = {role.id for role in before.roles}
+    after_ids = {role.id for role in after.roles}
+    added = [role for role in after.roles if role.id not in before_ids]
+    removed = [role for role in before.roles if role.id not in after_ids]
+
+    if added or removed:
+        entry = await recent_audit_entry(
+            after.guild,
+            discord.AuditLogAction.member_role_update,
+            after.id,
+        )
+        actor = getattr(entry, "user", None) if entry else None
+        fields = []
+        if added:
+            fields.append(("Added", ", ".join(role.mention for role in added), False))
+        if removed:
+            fields.append(("Removed", ", ".join(role.mention for role in removed), False))
+        fields.append(
+            (
+                "Changed by",
+                f"{actor} ({actor.id})" if actor else "Bot/self-role/unknown",
+                False,
+            )
+        )
+        await send_mod_log(
+            after.guild,
+            "🎭 Member roles changed",
+            f"Roles changed for {after.mention}.",
+            fields=fields,
+        )
+
+    if before.timed_out_until != after.timed_out_until:
+        entry = await recent_audit_entry(
+            after.guild,
+            discord.AuditLogAction.member_update,
+            after.id,
+        )
+        actor = getattr(entry, "user", None) if entry else None
+        reason = getattr(entry, "reason", None) if entry else None
+
+        if after.timed_out_until:
+            description = f"{after.mention} was timed out until <t:{int(after.timed_out_until.timestamp())}:F>."
+            title = "⏳ Member timed out"
+            colour = 0xFEE75C
+        else:
+            description = f"Timeout removed from {after.mention}."
+            title = "✅ Timeout removed"
+            colour = 0x57F287
+
+        await send_mod_log(
+            after.guild,
+            title,
+            description,
+            colour=colour,
+            fields=[
+                ("Moderator", f"{actor} ({actor.id})" if actor else "Unknown", False),
+                ("Reason", reason or "No reason recorded", False),
+            ],
+        )
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    if guild.id != GUILD_ID:
+        return
+
+    entry = await recent_audit_entry(
+        guild,
+        discord.AuditLogAction.ban,
+        user.id,
+    )
+    actor = getattr(entry, "user", None) if entry else None
+    reason = getattr(entry, "reason", None) if entry else None
+
+    await send_mod_log(
+        guild,
+        "🔨 Member banned",
+        f"**{user}** ({user.id}) was banned.",
+        colour=0xED4245,
+        fields=[
+            ("Moderator", f"{actor} ({actor.id})" if actor else "Unknown", False),
+            ("Reason", reason or "No reason recorded", False),
+        ],
+    )
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    if guild.id != GUILD_ID:
+        return
+
+    entry = await recent_audit_entry(
+        guild,
+        discord.AuditLogAction.unban,
+        user.id,
+    )
+    actor = getattr(entry, "user", None) if entry else None
+    reason = getattr(entry, "reason", None) if entry else None
+
+    await send_mod_log(
+        guild,
+        "🔓 Member unbanned",
+        f"**{user}** ({user.id}) was unbanned.",
+        colour=0x57F287,
+        fields=[
+            ("Moderator", f"{actor} ({actor.id})" if actor else "Unknown", False),
+            ("Reason", reason or "No reason recorded", False),
+        ],
+    )
+
+
+async def detect_and_log_kick(member: discord.Member) -> bool:
+    entry = await recent_audit_entry(
+        member.guild,
+        discord.AuditLogAction.kick,
+        member.id,
+    )
+    if not entry:
+        return False
+
+    actor = getattr(entry, "user", None)
+    await send_mod_log(
+        member.guild,
+        "👢 Member kicked",
+        f"**{member}** ({member.id}) was kicked.",
+        colour=0xED4245,
+        fields=[
+            ("Moderator", f"{actor} ({actor.id})" if actor else "Unknown", False),
+            ("Reason", entry.reason or "No reason recorded", False),
+        ],
+    )
+    return True
+
+
+def has_moderation_permission(member: discord.Member, permission: str) -> bool:
+    return (
+        member.guild.owner_id == member.id
+        or member.guild_permissions.administrator
+        or getattr(member.guild_permissions, permission, False)
+    )
+
+
+@bot.tree.command(
+    name="kick",
+    description="Kick a member from the server",
+    guild=GUILD,
+)
+@app_commands.describe(member="Member to kick", reason="Reason for the kick")
+async def kick_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not has_moderation_permission(actor, "kick_members"):
+        await interaction.response.send_message("You do not have Kick Members.", ephemeral=True)
+        return
+
+    allowed, error = actor_can_target(actor, member)
+    if not allowed:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    try:
+        await member.kick(reason=f"{actor}: {reason}")
+        await interaction.response.send_message(
+            f"👢 Kicked **{member}**. Reason: {reason}",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot kick that member because of role hierarchy or permissions.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="ban",
+    description="Ban a member from the server",
+    guild=GUILD,
+)
+@app_commands.describe(member="Member to ban", reason="Reason for the ban")
+async def ban_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not has_moderation_permission(actor, "ban_members"):
+        await interaction.response.send_message("You do not have Ban Members.", ephemeral=True)
+        return
+
+    allowed, error = actor_can_target(actor, member)
+    if not allowed:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    try:
+        await member.ban(reason=f"{actor}: {reason}")
+        await interaction.response.send_message(
+            f"🔨 Banned **{member}**. Reason: {reason}",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot ban that member because of role hierarchy or permissions.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="unban",
+    description="Unban a user by Discord user ID",
+    guild=GUILD,
+)
+@app_commands.describe(user_id="Discord user ID", reason="Reason for the unban")
+async def unban_cmd(
+    interaction: discord.Interaction,
+    user_id: str,
+    reason: str = "No reason provided",
+):
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not has_moderation_permission(actor, "ban_members"):
+        await interaction.response.send_message("You do not have Ban Members.", ephemeral=True)
+        return
+
+    try:
+        target_id = int(user_id)
+    except ValueError:
+        await interaction.response.send_message("That is not a valid user ID.", ephemeral=True)
+        return
+
+    try:
+        user = await bot.fetch_user(target_id)
+        await interaction.guild.unban(user, reason=f"{actor}: {reason}")
+        await interaction.response.send_message(
+            f"🔓 Unbanned **{user}**. Reason: {reason}",
+            ephemeral=True,
+        )
+    except discord.NotFound:
+        await interaction.response.send_message("That user is not banned.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot unban that user.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="timeout",
+    description="Timeout a member",
+    guild=GUILD,
+)
+@app_commands.describe(
+    member="Member to timeout",
+    minutes="Timeout length in minutes",
+    reason="Reason for the timeout",
+)
+async def timeout_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided",
+):
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not has_moderation_permission(actor, "moderate_members"):
+        await interaction.response.send_message("You do not have Moderate Members.", ephemeral=True)
+        return
+
+    allowed, error = actor_can_target(actor, member)
+    if not allowed:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    try:
+        await member.timeout(
+            timedelta(minutes=int(minutes)),
+            reason=f"{actor}: {reason}",
+        )
+        await interaction.response.send_message(
+            f"⏳ Timed out **{member}** for **{minutes} minutes**. Reason: {reason}",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot timeout that member because of role hierarchy or permissions.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="untimeout",
+    description="Remove a member timeout",
+    guild=GUILD,
+)
+@app_commands.describe(member="Member whose timeout should be removed", reason="Reason")
+async def untimeout_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not has_moderation_permission(actor, "moderate_members"):
+        await interaction.response.send_message("You do not have Moderate Members.", ephemeral=True)
+        return
+
+    allowed, error = actor_can_target(actor, member)
+    if not allowed:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    try:
+        await member.timeout(None, reason=f"{actor}: {reason}")
+        await interaction.response.send_message(
+            f"✅ Removed timeout from **{member}**.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot remove that timeout.",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
@@ -2851,6 +3323,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/channelpermissions` enforce read-only channel permissions\n"
         "`/serveraudit` audit roles, channels, permissions and panels\n"
         "`/cleanup` safely clean duplicate roles/channels/categories\n"
+        "`/kick`, `/ban`, `/unban`, `/timeout`, `/untimeout` moderation\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
