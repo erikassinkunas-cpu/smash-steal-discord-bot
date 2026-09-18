@@ -14,6 +14,7 @@ if not GUILD_ID_RAW or not GUILD_ID_RAW.isdigit():
     raise RuntimeError("GUILD_ID is missing or invalid")
 GUILD_ID = int(GUILD_ID_RAW)
 ENABLE_MEMBER_EVENTS = os.environ.get("ENABLE_MEMBER_EVENTS", "0") == "1"
+RUN_CLEANUP_ON_START = os.environ.get("RUN_CLEANUP_ON_START", "0") == "1"
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -1954,6 +1955,311 @@ async def panels_cmd(interaction: discord.Interaction):
         )
 
 
+async def ensure_archive_category(guild: discord.Guild):
+    archive = discord.utils.get(guild.categories, name="🗃️ ARCHIVE")
+    if archive:
+        return archive
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False)
+    }
+    for role in staff_roles(guild):
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            connect=True,
+            speak=True,
+        )
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            connect=True,
+            speak=True,
+        )
+
+    return await guild.create_category(
+        "🗃️ ARCHIVE",
+        overwrites=overwrites,
+        reason="Smash & Steal safe cleanup archive",
+    )
+
+
+async def channel_has_messages(channel: discord.TextChannel) -> bool:
+    try:
+        async for _ in channel.history(limit=1):
+            return True
+    except discord.HTTPException:
+        return True
+    return False
+
+
+async def safe_cleanup_server(guild: discord.Guild):
+    report = {
+        "roles_deleted": [],
+        "members_migrated": 0,
+        "text_deleted": [],
+        "text_archived": [],
+        "voice_deleted": [],
+        "voice_archived": [],
+        "categories_deleted": [],
+        "channels_moved": [],
+        "created": [],
+        "skipped": [],
+    }
+
+    me = guild.me
+    if not me:
+        report["skipped"].append("Bot member unavailable")
+        return report
+
+    # 1. Role duplicates. Keep the exact canonical emoji role.
+    for base_name in ROLE_SPECS:
+        canonical_name = role_display_name(base_name)
+        canonical = discord.utils.get(guild.roles, name=canonical_name)
+        if not canonical:
+            try:
+                canonical = await ensure_role(
+                    guild,
+                    base_name,
+                    ROLE_SPECS[base_name]["hoist"],
+                )
+                report["created"].append(f"role:{canonical.name}")
+            except Exception as exc:
+                report["skipped"].append(
+                    f"Cannot create canonical role {canonical_name}: {type(exc).__name__}"
+                )
+                continue
+
+        target_key = normalise_role_name(base_name)
+        duplicates = [
+            role
+            for role in list(guild.roles)
+            if not role.is_default()
+            and not role.managed
+            and role.id != canonical.id
+            and normalise_role_name(role.name) == target_key
+        ]
+
+        for old_role in duplicates:
+            if old_role >= me.top_role:
+                report["skipped"].append(
+                    f"Role above bot, not deleted: {old_role.name}"
+                )
+                continue
+
+            for member in list(old_role.members):
+                try:
+                    if canonical not in member.roles:
+                        await member.add_roles(
+                            canonical,
+                            reason="Smash & Steal role cleanup migration",
+                        )
+                    await member.remove_roles(
+                        old_role,
+                        reason="Smash & Steal role cleanup migration",
+                    )
+                    report["members_migrated"] += 1
+                except discord.HTTPException:
+                    report["skipped"].append(
+                        f"Could not migrate {member} from {old_role.name}"
+                    )
+
+            try:
+                await old_role.delete(reason="Smash & Steal duplicate role cleanup")
+                report["roles_deleted"].append(old_role.name)
+            except discord.HTTPException as exc:
+                report["skipped"].append(
+                    f"Could not delete role {old_role.name}: HTTP {exc.status}"
+                )
+
+    archive = None
+
+    # 2. Duplicate text channels. Keep exact canonical. Delete only empty duplicates.
+    for base_name, canonical_name in CHANNEL_NAMES.items():
+        canonical = discord.utils.get(guild.text_channels, name=canonical_name)
+        if not canonical:
+            continue
+
+        key = normalise_channel_name(base_name)
+        duplicates = [
+            channel
+            for channel in list(guild.text_channels)
+            if channel.id != canonical.id
+            and normalise_channel_name(channel.name) == key
+        ]
+
+        for old in duplicates:
+            if await channel_has_messages(old):
+                if archive is None:
+                    archive = await ensure_archive_category(guild)
+                legacy_name = f"🗃️・legacy-{base_name}-{str(old.id)[-4:]}"
+                try:
+                    await old.edit(
+                        name=legacy_name,
+                        category=archive,
+                        sync_permissions=False,
+                        reason="Smash & Steal preserve legacy channel",
+                    )
+                    await set_staff_only(old)
+                    report["text_archived"].append(legacy_name)
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not archive {old.name}: HTTP {exc.status}"
+                    )
+            else:
+                old_name = old.name
+                try:
+                    await old.delete(reason="Smash & Steal empty duplicate channel cleanup")
+                    report["text_deleted"].append(old_name)
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not delete {old_name}: HTTP {exc.status}"
+                    )
+
+    # 3. Duplicate voice channels.
+    for base_name, canonical_name in VOICE_NAMES.items():
+        canonical = discord.utils.get(guild.voice_channels, name=canonical_name)
+        if not canonical:
+            continue
+
+        key = normalise_channel_name(base_name)
+        duplicates = [
+            channel
+            for channel in list(guild.voice_channels)
+            if channel.id != canonical.id
+            and normalise_channel_name(channel.name) == key
+        ]
+
+        for old in duplicates:
+            if old.members:
+                if archive is None:
+                    archive = await ensure_archive_category(guild)
+                legacy_name = f"🗃️・legacy-{safe_name(base_name)}-{str(old.id)[-4:]}"
+                try:
+                    await old.edit(
+                        name=legacy_name,
+                        category=archive,
+                        sync_permissions=False,
+                        reason="Smash & Steal preserve occupied legacy voice",
+                    )
+                    await set_staff_only(old)
+                    report["voice_archived"].append(legacy_name)
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not archive voice {old.name}: HTTP {exc.status}"
+                    )
+            else:
+                old_name = old.name
+                try:
+                    await old.delete(reason="Smash & Steal duplicate voice cleanup")
+                    report["voice_deleted"].append(old_name)
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not delete voice {old_name}: HTTP {exc.status}"
+                    )
+
+    # 4. Duplicate categories. Move remaining children into canonical category.
+    for plain_name, canonical_name in CATEGORY_NAMES.items():
+        canonical = discord.utils.get(guild.categories, name=canonical_name)
+        if not canonical:
+            continue
+
+        key = normalise_channel_name(plain_name)
+        duplicates = [
+            category
+            for category in list(guild.categories)
+            if category.id != canonical.id
+            and normalise_channel_name(category.name) == key
+        ]
+
+        for old_category in duplicates:
+            for child in list(old_category.channels):
+                try:
+                    await child.edit(
+                        category=canonical,
+                        sync_permissions=False,
+                        reason="Smash & Steal duplicate category cleanup",
+                    )
+                    report["channels_moved"].append(
+                        f"{child.name} -> {canonical.name}"
+                    )
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not move {child.name}: HTTP {exc.status}"
+                    )
+
+            if not old_category.channels:
+                old_name = old_category.name
+                try:
+                    await old_category.delete(
+                        reason="Smash & Steal duplicate category cleanup"
+                    )
+                    report["categories_deleted"].append(old_name)
+                except discord.HTTPException as exc:
+                    report["skipped"].append(
+                        f"Could not delete category {old_name}: HTTP {exc.status}"
+                    )
+
+    # 5. Ensure missing managed voice channels exist.
+    team_category = find_category(guild, "🔒 TEAM")
+    if team_category:
+        team_room = (
+            discord.utils.get(guild.voice_channels, name=VOICE_NAMES["Team Room"])
+            or discord.utils.get(guild.voice_channels, name="Team Room")
+        )
+        if not team_room:
+            try:
+                created = await ensure_voice(guild, team_category, "Team Room")
+                report["created"].append(f"voice:{created.name}")
+            except discord.HTTPException as exc:
+                report["skipped"].append(
+                    f"Could not create Team Room: HTTP {exc.status}"
+                )
+
+    # Re-apply all managed permissions and core messages after moving/deleting.
+    await ensure_entry_system(guild)
+
+    return report
+
+
+def format_cleanup_report(report):
+    lines = [
+        "## 🧹 Smash & Steal Cleanup",
+        f"Roles deleted: **{len(report['roles_deleted'])}**",
+        f"Member-role migrations: **{report['members_migrated']}**",
+        f"Empty text duplicates deleted: **{len(report['text_deleted'])}**",
+        f"Legacy text channels archived: **{len(report['text_archived'])}**",
+        f"Voice duplicates deleted: **{len(report['voice_deleted'])}**",
+        f"Legacy voice channels archived: **{len(report['voice_archived'])}**",
+        f"Duplicate categories deleted: **{len(report['categories_deleted'])}**",
+        f"Channels moved: **{len(report['channels_moved'])}**",
+        f"Missing items created: **{len(report['created'])}**",
+        f"Skipped/errors: **{len(report['skipped'])}**",
+    ]
+
+    for title, key in [
+        ("Deleted roles", "roles_deleted"),
+        ("Deleted text channels", "text_deleted"),
+        ("Archived text channels", "text_archived"),
+        ("Deleted voice channels", "voice_deleted"),
+        ("Deleted categories", "categories_deleted"),
+        ("Created", "created"),
+        ("Skipped", "skipped"),
+    ]:
+        values = report[key]
+        if values:
+            lines.append(
+                f"\n**{title}:**\n"
+                + "\n".join(f"• {value}" for value in values[:20])
+            )
+
+    return "\n".join(lines)
+
+
 def normalise_channel_name(value: str) -> str:
     value = value.strip()
     value = re.sub(r"^[^A-Za-z0-9]+", "", value)
@@ -2241,6 +2547,34 @@ def format_server_audit(result, max_items=35):
 
 
 @bot.tree.command(
+    name="cleanup",
+    description="Safely clean duplicate roles, channels and categories",
+    guild=GUILD,
+)
+async def cleanup_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    report = await safe_cleanup_server(interaction.guild)
+    audit = await server_audit(interaction.guild)
+    content = (
+        format_cleanup_report(report)
+        + "\n\n"
+        + format_server_audit(audit, max_items=20)
+    )
+    await interaction.edit_original_response(content=content[:1990])
+
+
+@bot.tree.command(
     name="serveraudit",
     description="Audit channels, roles, permissions, verification and panels",
     guild=GUILD,
@@ -2288,6 +2622,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/entrysetup` fix verification gate and entry channels\n"
         "`/channelpermissions` enforce read-only channel permissions\n"
         "`/serveraudit` audit roles, channels, permissions and panels\n"
+        "`/cleanup` safely clean duplicate roles/channels/categories\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
@@ -2351,6 +2686,26 @@ async def on_ready():
 
         guild = bot.get_guild(GUILD_ID)
         if guild:
+            if RUN_CLEANUP_ON_START:
+                try:
+                    cleanup_report = await safe_cleanup_server(guild)
+                    print(
+                        "CLEANUP DONE | "
+                        f"roles_deleted={len(cleanup_report['roles_deleted'])} | "
+                        f"text_deleted={len(cleanup_report['text_deleted'])} | "
+                        f"text_archived={len(cleanup_report['text_archived'])} | "
+                        f"voice_deleted={len(cleanup_report['voice_deleted'])} | "
+                        f"categories_deleted={len(cleanup_report['categories_deleted'])} | "
+                        f"created={cleanup_report['created']} | "
+                        f"skipped={cleanup_report['skipped']}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"CLEANUP FAILED | {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
             try:
                 await ensure_entry_system(guild)
                 print("ENTRY AUTO-SYNC DONE", flush=True)
