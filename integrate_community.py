@@ -9,8 +9,10 @@ from pathlib import Path
 ANCHOR = 'bot.run(TOKEN, log_handler=None)'
 REPLACEMENT = '''# SAS extensions integration
 from community import install_community
+from levels_v1 import install_levels
 from moderation_v2 import install_moderation
 install_community(globals())
+install_levels(globals())
 install_moderation(globals())
 bot.run(TOKEN)
 '''
