@@ -1286,6 +1286,95 @@ async def post_panels(guild: discord.Guild):
     await ensure_entry_system(guild)
 
 
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id != GUILD_ID or str(payload.emoji) != "✅":
+        return
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+
+    verify = find_text(guild, "verify")
+    if not verify or payload.channel_id != verify.id:
+        return
+    if VERIFY_MESSAGE_ID and payload.message_id != VERIFY_MESSAGE_ID:
+        return
+
+    member = payload.member
+    if not member or member.bot:
+        return
+
+    if getattr(member, "pending", False):
+        try:
+            await member.send(
+                "Complete Discord membership screening first, then react with ✅ again."
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    role = find_role(guild, "Member")
+    if not role or role in member.roles:
+        return
+
+    try:
+        await member.add_roles(role, reason="Verified with ✅ reaction")
+    except discord.Forbidden:
+        pass
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if not ENABLE_MEMBER_EVENTS or member.guild.id != GUILD_ID or member.bot:
+        return
+
+    channel = find_text(member.guild, "welcome")
+    if not channel:
+        return
+
+    rules = find_text(member.guild, "rules")
+    verify = find_text(member.guild, "verify")
+    rules_text = rules.mention if rules else "#rules"
+    verify_text = verify.mention if verify else "#verify"
+
+    embed = discord.Embed(
+        title="👋 Welcome to Smash & Steal!",
+        description=(
+            f"Welcome {member.mention}!\n"
+            f"Read {rules_text} and verify in {verify_text} to unlock the server."
+        ),
+        colour=discord.Colour(0x57F287),
+    )
+    embed.set_footer(text=f"Member #{member.guild.member_count}")
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if not ENABLE_MEMBER_EVENTS or member.guild.id != GUILD_ID or member.bot:
+        return
+
+    channel = find_text(member.guild, "goodbye")
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title="👋 Goodbye",
+        description=f"**{member.display_name}** left the server.",
+        colour=discord.Colour(0xED4245),
+    )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
 @bot.tree.command(
     name="setup",
     description="Create or update the Smash & Steal server structure",
@@ -1368,6 +1457,40 @@ async def setup_cmd(interaction: discord.Interaction):
                 content=f"❌ Setup stopped because of an error: `{type(exc).__name__}: {exc}`"
             )
             raise
+
+
+@bot.tree.command(
+    name="entrysetup",
+    description="Fix verification gate, rules, verify and choose-role panels",
+    guild=GUILD,
+)
+async def entrysetup_cmd(interaction: discord.Interaction):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not is_staff(interaction.user)
+    ):
+        await interaction.response.send_message(
+            "Only the server owner or staff can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await ensure_entry_system(interaction.guild)
+        await interaction.edit_original_response(
+            content=(
+                "## ✅ Entry system fixed\n"
+                "Unverified users can now see only start-here, rules and verify.\n"
+                "The ✅ reaction grants Member.\n"
+                "choose-roles becomes visible after verification."
+            )
+        )
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"❌ Entry setup failed: {type(exc).__name__}: {exc}"
+        )
 
 
 @bot.tree.command(
@@ -1720,6 +1843,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/setup` create missing server structure\n"
         "`/rolesetup` force-fix role colours, emojis, permissions and order\n"
         "`/roleaudit` check every managed role\n"
+        "`/entrysetup` fix verification gate and entry channels\n"
         "`/emojis` fix channel emoji names\n"
         "`/panels` post interactive panels\n"
         "`/status` bot health check",
@@ -1768,8 +1892,29 @@ async def auto_sync_roles_on_startup():
 
 @bot.event
 async def on_ready():
-    print(f"BOT READY | {bot.user} | guild={GUILD_ID}", flush=True)
-    await auto_sync_roles_on_startup()
+    global STARTUP_SYNC_DONE
+    print(
+        f"BOT READY | {bot.user} | guild={GUILD_ID} | member_events={ENABLE_MEMBER_EVENTS}",
+        flush=True,
+    )
+
+    async with startup_sync_lock:
+        if STARTUP_SYNC_DONE:
+            return
+        STARTUP_SYNC_DONE = True
+
+        await auto_sync_roles_on_startup()
+
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            try:
+                await ensure_entry_system(guild)
+                print("ENTRY AUTO-SYNC DONE", flush=True)
+            except Exception as exc:
+                print(
+                    f"ENTRY AUTO-SYNC FAILED | {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
 
 bot.run(TOKEN, log_handler=None)
