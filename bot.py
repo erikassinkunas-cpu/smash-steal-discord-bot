@@ -3189,9 +3189,20 @@ async def server_audit(guild: discord.Guild):
             f"(channels={bool(welcome and goodbye)}, env={ENABLE_MEMBER_EVENTS}, intent={bot.intents.members})"
         )
 
+    # Logging capability checks.
+    if not bot.intents.message_content:
+        warnings.append(
+            "Message Content Intent is disabled: deleted/edited message text "
+            "and ticket transcript bodies may be unavailable."
+        )
+
     # Bot permissions relevant to this server.
     me = guild.me
     if me:
+        if not me.guild_permissions.view_audit_log:
+            warnings.append(
+                "Bot is missing View Audit Log: moderator actor/reason detection may show Unknown."
+            )
         required_bot_permissions = {
             "manage_roles": me.guild_permissions.manage_roles,
             "manage_channels": me.guild_permissions.manage_channels,
