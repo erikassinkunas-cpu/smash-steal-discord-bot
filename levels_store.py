@@ -230,6 +230,18 @@ class LevelStore:
                 "needed": needed,
             }
 
+    def levels(self, guild_id):
+        gid = str(guild_id)
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT user_id, total_xp FROM members WHERE guild_id=?",
+                (gid,),
+            ).fetchall()
+            return {
+                row["user_id"]: level_from_total(int(row["total_xp"]))[0]
+                for row in rows
+            }
+
     def stats(self, guild_id):
         gid = str(guild_id)
         with closing(self.connect()) as db:
