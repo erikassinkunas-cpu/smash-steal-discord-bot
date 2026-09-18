@@ -952,25 +952,338 @@ async def setup_server(guild: discord.Guild, progress=None):
     return created
 
 
-async def post_panels(guild: discord.Guild):
+def access_roles(guild: discord.Guild):
+    names = [
+        "Owner", "Founder", "Developer", "Community Manager", "Moderator",
+        "Helper", "Tester", "Early Crew", "Bug Hunter", "Content Creator",
+        "Contributor", "Member",
+    ]
+    return [role for name in names if (role := find_role(guild, name))]
+
+
+def staff_roles(guild: discord.Guild):
+    return [role for name in STAFF_ROLE_NAMES if (role := find_role(guild, name))]
+
+
+async def allow_bot(channel):
+    if channel.guild.me:
+        await channel.set_permissions(
+            channel.guild.me,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            add_reactions=True,
+            manage_messages=True,
+            manage_channels=True,
+        )
+
+
+async def set_hidden_until_member(channel, read_only=False):
+    guild = channel.guild
+    await channel.set_permissions(guild.default_role, view_channel=False)
+    for role in access_roles(guild):
+        await channel.set_permissions(
+            role,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False if read_only else True,
+        )
+    await allow_bot(channel)
+
+
+async def set_staff_only(channel):
+    guild = channel.guild
+    await channel.set_permissions(guild.default_role, view_channel=False)
+    member = find_role(guild, "Member")
+    if member:
+        await channel.set_permissions(member, view_channel=False)
+    for role in staff_roles(guild):
+        await channel.set_permissions(
+            role,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            connect=True if isinstance(channel, discord.VoiceChannel) else None,
+            speak=True if isinstance(channel, discord.VoiceChannel) else None,
+        )
+    await allow_bot(channel)
+
+
+async def set_tester_only(channel):
+    guild = channel.guild
+    await channel.set_permissions(guild.default_role, view_channel=False)
+    for role in access_roles(guild):
+        await channel.set_permissions(role, view_channel=False)
+    tester = find_role(guild, "Tester")
+    if tester:
+        if isinstance(channel, discord.VoiceChannel):
+            await channel.set_permissions(tester, view_channel=True, connect=True, speak=True)
+        else:
+            await channel.set_permissions(
+                tester,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+            )
+    for role in staff_roles(guild):
+        if isinstance(channel, discord.VoiceChannel):
+            await channel.set_permissions(role, view_channel=True, connect=True, speak=True)
+        else:
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+            )
+    await allow_bot(channel)
+
+
+async def apply_verification_gate(guild: discord.Guild):
+    member = find_role(guild, "Member")
+    if not member:
+        raise RuntimeError("Member role is missing")
+
+    start_here = find_text(guild, "start-here")
+    rules = find_text(guild, "rules")
+    verify = find_text(guild, "verify")
+    choose_roles = find_text(guild, "choose-roles")
+
+    for channel in [start_here, rules, verify]:
+        if not channel:
+            continue
+        await channel.set_permissions(
+            guild.default_role,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            add_reactions=(channel == verify),
+        )
+        for role in access_roles(guild):
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+                add_reactions=(channel == verify),
+            )
+        await allow_bot(channel)
+
+    if choose_roles:
+        await set_hidden_until_member(choose_roles, read_only=True)
+
+    read_only = [
+        "announcements", "sneak-peeks", "update-log", "hall-of-fame",
+        "help-and-faq", "open-ticket", "test-info", "known-issues",
+        "welcome", "goodbye",
+    ]
+    writable = [
+        "general", "clips-and-loot", "find-a-crew", "polls-and-events",
+        "bug-reports", "suggestions",
+    ]
+
+    for name in read_only:
+        channel = find_text(guild, name)
+        if channel:
+            await set_hidden_until_member(channel, read_only=True)
+
+    for name in writable:
+        channel = find_text(guild, name)
+        if channel:
+            await set_hidden_until_member(channel, read_only=False)
+
+    tester_chat = find_text(guild, "tester-chat")
+    if tester_chat:
+        await set_tester_only(tester_chat)
+
+    for name in ["staff-chat", "mod-alerts", "bot-logs"]:
+        channel = find_text(guild, name)
+        if channel:
+            await set_staff_only(channel)
+
+    for base_name in ["Hangout", "Crew Room"]:
+        display_name = VOICE_NAMES[base_name]
+        channel = (
+            discord.utils.get(guild.voice_channels, name=display_name)
+            or discord.utils.get(guild.voice_channels, name=base_name)
+        )
+        if channel:
+            await channel.set_permissions(guild.default_role, view_channel=False)
+            for role in access_roles(guild):
+                await channel.set_permissions(role, view_channel=True, connect=True, speak=True)
+
+    playtest_room = (
+        discord.utils.get(guild.voice_channels, name=VOICE_NAMES["Playtest Room"])
+        or discord.utils.get(guild.voice_channels, name="Playtest Room")
+    )
+    if playtest_room:
+        await set_tester_only(playtest_room)
+
+    team_room = (
+        discord.utils.get(guild.voice_channels, name=VOICE_NAMES["Team Room"])
+        or discord.utils.get(guild.voice_channels, name="Team Room")
+    )
+    if team_room:
+        await set_staff_only(team_room)
+
+    entry_ids = {x.id for x in [start_here, rules, verify] if x}
+    special = {x.id for x in [choose_roles, tester_chat, playtest_room, team_room] if x}
+
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+        if channel.id in entry_ids or channel.id in special:
+            continue
+        if channel.category and channel.category.name in {"🔒 TEAM", "🎫 TICKETS"}:
+            continue
+        await channel.set_permissions(guild.default_role, view_channel=False)
+
+
+async def upsert_bot_message(channel, marker, content, view=None, reaction=None):
+    global VERIFY_MESSAGE_ID
+    existing = None
+    try:
+        async for message in channel.history(limit=50):
+            if message.author == channel.guild.me and message.content.startswith(marker):
+                existing = message
+                break
+    except discord.HTTPException:
+        pass
+
+    if existing:
+        await existing.edit(content=content, view=view)
+        message = existing
+    else:
+        message = await channel.send(content, view=view)
+
+    if reaction:
+        try:
+            await message.add_reaction(reaction)
+        except discord.HTTPException:
+            pass
+
+    if marker.startswith("## ✅ Verify"):
+        VERIFY_MESSAGE_ID = message.id
+
+    try:
+        if not message.pinned:
+            await message.pin(reason="Smash & Steal core server message")
+    except discord.HTTPException:
+        pass
+
+    return message
+
+
+async def ensure_core_messages(guild: discord.Guild):
+    start = find_text(guild, "start-here")
+    rules = find_text(guild, "rules")
     verify = find_text(guild, "verify")
     choose_roles = find_text(guild, "choose-roles")
     tickets = find_text(guild, "open-ticket")
-    if not verify or not choose_roles or not tickets:
-        raise RuntimeError("Required channels are missing. Run /setup first.")
 
-    await verify.send(
-        "## ✅ Verify\nAccept the server rules first. Then press **Get Member** to unlock Member access.",
-        view=VerifyView(),
+    if not all([start, rules, verify, choose_roles, tickets]):
+        raise RuntimeError("One or more core channels are missing")
+
+    await upsert_bot_message(
+        start,
+        "## 👋 Welcome to Smash & Steal",
+        "## 👋 Welcome to Smash & Steal\n"
+        "To unlock the server:\n"
+        f"**1.** Read {rules.mention}\n"
+        f"**2.** Go to {verify.mention}\n"
+        "**3.** React with ✅ or press Get Member\n"
+        f"**4.** After verification, choose your roles in {choose_roles.mention}\n\n"
+        "Until you verify, the rest of the server stays hidden.",
     )
-    await choose_roles.send(
-        "## 🎭 Choose your roles\nToggle the notifications and platforms you want. These roles do not grant staff access.",
+
+    await upsert_bot_message(
+        rules,
+        "## 📜 Smash & Steal Rules",
+        "## 📜 Smash & Steal Rules\n"
+        "**1. Respect other members.** No harassment, hate speech, threats, or targeted abuse.\n"
+        "**2. No spam.** Do not flood chats, mass mention people, or repeatedly post the same content.\n"
+        "**3. No scams or malicious links.** No phishing, malware, impersonation, or fake giveaways.\n"
+        "**4. Keep content appropriate.** No NSFW, sexual, gore, or shock content.\n"
+        "**5. No cheating or exploit distribution.** Report game exploits privately through tickets.\n"
+        "**6. Protect privacy.** Do not post private information or doxx anyone.\n"
+        "**7. Use channels for their purpose.** Keep discussions in the relevant channels.\n"
+        "**8. Do not evade moderation.** Do not use alternate accounts to bypass restrictions.\n"
+        "**9. Follow platform rules.** Discord and Roblox platform rules still apply.\n"
+        "**10. Appeal staff actions privately.** Use a support ticket instead of public arguments.\n\n"
+        "By verifying, you confirm that you have read and agree to these rules.",
+    )
+
+    await upsert_bot_message(
+        verify,
+        "## ✅ Verify",
+        "## ✅ Verify\n"
+        f"Read {rules.mention} first.\n\n"
+        "**React with ✅ below** or press **Get Member**.\n"
+        "The bot will give you the ✅・Member role and unlock the rest of the server.\n\n"
+        "Reacting means you confirm that you have read and agree to the server rules.",
+        view=VerifyView(),
+        reaction="✅",
+    )
+
+    await upsert_bot_message(
+        choose_roles,
+        "## 🎭 Choose Your Roles",
+        "## 🎭 Choose Your Roles\n"
+        "Use the buttons below to toggle roles. Press the same button again to remove a role.\n\n"
+        "**Notifications**\n"
+        "📢 Update Ping: game updates\n"
+        "🧪 Playtest Ping: testing announcements\n"
+        "🎉 Event Ping: community events\n"
+        "👀 Sneak Peek Ping: previews and teasers\n\n"
+        "**Platform**\n"
+        "🖥️ PC\n"
+        "📱 Mobile\n"
+        "🎮 Console\n\n"
+        "These roles do not grant staff permissions.",
         view=RolePickerView(),
     )
-    await tickets.send(
-        "## 🎫 Support\nChoose the ticket type you need. Player reports and exploit reports stay private.",
+
+    await upsert_bot_message(
+        tickets,
+        "## 🎫 Support",
+        "## 🎫 Support\n"
+        "Choose a ticket type below.\n\n"
+        "🎮 Game Help: gameplay or account-related help\n"
+        "🚩 Report Player: report rule-breaking with evidence\n"
+        "🔐 Report Exploit: report a game exploit privately",
         view=TicketView(),
     )
+
+
+async def ensure_entry_channels(guild: discord.Guild):
+    start_category = find_category(guild, "🚪 START HERE")
+    if not start_category:
+        start_category = await ensure_category(guild, "🚪 START HERE")
+
+    community = find_category(guild, "🏙️ COMMUNITY")
+    if not community:
+        community = await ensure_category(guild, "🏙️ COMMUNITY")
+
+    support = find_category(guild, "🛟 SUPPORT")
+    if not support:
+        support = await ensure_category(guild, "🛟 SUPPORT")
+
+    await ensure_text(guild, start_category, "start-here", True, False)
+    await ensure_text(guild, start_category, "rules", True, False)
+    await ensure_text(guild, start_category, "verify", True, False)
+    await ensure_text(guild, start_category, "choose-roles", True, True)
+    await ensure_text(guild, community, "welcome", True, True)
+    await ensure_text(guild, community, "goodbye", True, True)
+    await ensure_text(guild, support, "open-ticket", True, True)
+
+
+async def ensure_entry_system(guild: discord.Guild):
+    await ensure_entry_channels(guild)
+    await apply_verification_gate(guild)
+    await ensure_core_messages(guild)
+
+
+async def post_panels(guild: discord.Guild):
+    await ensure_entry_system(guild)
 
 
 @bot.tree.command(
