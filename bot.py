@@ -13,9 +13,12 @@ if not TOKEN:
 if not GUILD_ID_RAW or not GUILD_ID_RAW.isdigit():
     raise RuntimeError("GUILD_ID is missing or invalid")
 GUILD_ID = int(GUILD_ID_RAW)
+ENABLE_MEMBER_EVENTS = os.environ.get("ENABLE_MEMBER_EVENTS", "0") == "1"
 
 intents = discord.Intents.default()
 intents.guilds = True
+intents.reactions = True
+intents.members = ENABLE_MEMBER_EVENTS
 
 
 BASE_MEMBER_PERMISSIONS = {
@@ -248,6 +251,8 @@ CHANNEL_NAMES = {
     "sneak-peeks": "👀・sneak-peeks",
     "update-log": "📝・update-log",
     "general": "💬・general",
+    "welcome": "👋・welcome",
+    "goodbye": "👋・goodbye",
     "clips-and-loot": "💰・clips-and-loot",
     "find-a-crew": "🤝・find-a-crew",
     "polls-and-events": "🎉・polls-and-events",
@@ -610,6 +615,9 @@ class SmashStealBot(discord.Client):
 bot = SmashStealBot()
 GUILD = discord.Object(id=GUILD_ID)
 setup_lock = asyncio.Lock()
+startup_sync_lock = asyncio.Lock()
+STARTUP_SYNC_DONE = False
+VERIFY_MESSAGE_ID = None
 
 
 def build_permissions(spec):
@@ -807,7 +815,7 @@ async def setup_server(guild: discord.Guild, progress=None):
     totals = {
         "roles": len(ROLE_DEFS),
         "categories": 7,
-        "channels": 26,
+        "channels": 28,
         "permissions": 2,
     }
     done = {key: 0 for key in totals}
@@ -869,6 +877,8 @@ async def setup_server(guild: discord.Guild, progress=None):
         (updates, "sneak-peeks", True, False),
         (updates, "update-log", True, False),
         (community, "general", False, True),
+        (community, "welcome", True, True),
+        (community, "goodbye", True, True),
         (community, "clips-and-loot", False, True),
         (community, "find-a-crew", False, True),
         (community, "polls-and-events", False, True),
